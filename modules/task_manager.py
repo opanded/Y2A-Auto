@@ -694,6 +694,74 @@ def _normalize_tags_list(value):
     return tags
 
 
+def _build_sensitive_replace_pairs(config):
+    """解析敏感词替换表，按原文长度降序返回 [(原文, 替代词)]。
+
+    长词优先，避免「乳头」被短词先改掉、导致「大乳头」这类更长匹配失效。
+    替换词为空的条目直接跳过（允许用户临时「停用」某条而不删配置）。
+    """
+    raw = (config or {}).get('SENSITIVE_WORD_REPLACE_MAP')
+    mapping = _safe_json_loads(raw, {})
+    if isinstance(mapping, dict):
+        pairs = []
+        for src, dst in mapping.items():
+            src_text = str(src or '')
+            dst_text = str(dst or '')
+            if src_text and dst_text and src_text != dst_text:
+                pairs.append((src_text, dst_text))
+        pairs.sort(key=lambda item: -len(item[0]))
+        return pairs
+    return []
+
+
+def _apply_sensitive_word_replace(text, pairs):
+    """按替换表做纯文本替换。幂等：替代词再次命中原文时不会二次改写。"""
+    result = str(text or '')
+    if not result or not pairs:
+        return result
+    for src, dst in pairs:
+        if src in result:
+            result = result.replace(src, dst)
+    return result
+
+
+def _sanitize_upload_fields(config, logger_obj, **fields):
+    """对投稿字段统一做敏感词替换，返回处理后的 dict。
+
+    只处理 SENSITIVE_WORD_REPLACE_TARGETS 声明的字段，默认覆盖
+    title / description / tags。关闭开关或替换表为空时原样返回。
+    """
+    if not _as_bool((config or {}).get('SENSITIVE_WORD_REPLACE_ENABLED', True)):
+        return fields
+    pairs = _build_sensitive_replace_pairs(config)
+    if not pairs:
+        return fields
+
+    targets = str(
+        (config or {}).get('SENSITIVE_WORD_REPLACE_TARGETS') or 'title,description,tags'
+    )
+    enabled = {t.strip().lower() for t in targets.split(',') if t.strip()}
+
+    cleaned = dict(fields)
+    for key in ('title', 'description'):
+        if key in enabled and isinstance(cleaned.get(key), str):
+            before = cleaned[key]
+            after = _apply_sensitive_word_replace(before, pairs)
+            if after != before and logger_obj:
+                logger_obj.info(
+                    "投稿字段 %s 已做敏感词替换: %s -> %s",
+                    key, before[:60], after[:60],
+                )
+            cleaned[key] = after
+
+    if 'tags' in enabled and isinstance(cleaned.get('tags'), list):
+        cleaned['tags'] = [
+            _apply_sensitive_word_replace(tag, pairs) for tag in cleaned['tags']
+        ]
+
+    return cleaned
+
+
 def _as_bool(value):
     """将配置值稳健转换为布尔值（兼容 bool/int/str）。"""
     if isinstance(value, bool):
@@ -701,6 +769,68 @@ def _as_bool(value):
     if isinstance(value, (int, float)):
         return value != 0
     return str(value).strip().lower() in ('true', '1', 'on', 'yes')
+
+
+def _is_permanent_download_failure(error_message) -> bool:
+    """判断下载失败是否属于「重试也不会成功」的永久性原因。
+
+    典型：地区限制（uploader has not made this video available in your
+    country）、视频已删除/私有、账号受限。这类重试只会反复失败。
+    """
+    text = str(error_message or '').lower()
+    if not text:
+        return False
+    permanent_markers = (
+        'not available in your count',      # 地区限制（原文被截断）
+        'not available in your country',
+        'video unavailable',
+        'has been removed',
+        'this video is private',
+        'account associated with this video has been terminated',
+        'copyright',
+        '已被删除',
+        '地区限制',
+    )
+    return any(marker in text for marker in permanent_markers)
+
+
+def _is_retryable_upload_error(result) -> bool:
+    """判断上传失败是否值得重试。
+
+    分三类：
+    1. 传输层错误（超时、连接重置等）→ 重试。
+    2. preupload 406 → 重试。实测成功与失败在同一批次交替出现，是上传频率
+       触发的限流，而不是账号被风控；隔一段时间重试通常能过。
+    3. 明确的账号级风控/业务错误（-352、603、cookie 失效、投稿被拒）→ 不重试，
+       重试只会持续撞墙。
+    """
+    text = str(result or '').lower()
+    if not text:
+        return False
+
+    # 账号级风控与业务拒绝：重试无意义
+    hard_block_markers = (
+        '-352', '-111', '603', 'cookie 失效', '登录态无效',
+        'csrf', '投稿被拒', '违规', '审核不通过', '账号异常',
+    )
+    if any(marker in text for marker in hard_block_markers):
+        return False
+
+    # preupload 406：频率限流，可重试
+    if 'preupload' in text and '406' in text:
+        return True
+    if '406' in text and ('风控' in text or '拒绝' in text):
+        return True
+
+    network_markers = (
+        'curl: (28)', 'curl: (7)', 'curl: (35)', 'curl: (52)', 'curl: (56)',
+        'timed out', 'timeout', 'connection was reset', 'connection reset',
+        'connection aborted', 'recv failure', 'send failure',
+        'failed to perform', 'ssl', 'eof occurred',
+        'temporary failure in name resolution', 'network is unreachable',
+        'connection refused', 'remote end closed connection',
+    )
+    return any(marker in text for marker in network_markers)
 
 
 def _as_int(value, default, minimum=None):
@@ -2190,6 +2320,12 @@ def retry_failed_tasks(config=None):
         original_error = task.get('error_message')
         upload_target = _get_task_upload_target(task)
 
+        # 地区限制类失败重试也不会成功（YouTube 侧不向本地区提供该视频），
+        # 直接跳过，避免每轮重试都白跑一批必定失败的任务。
+        if _is_permanent_download_failure(original_error):
+            failed_ids.append(task_id)
+            continue
+
         # 失败状态兜底修复：目标平台其实都成功时，直接纠正为 completed，避免重复调度
         if _task_has_upload_response(task, upload_target):
             update_task(
@@ -3402,9 +3538,60 @@ class TaskProcessor:
                         update_task(task_id, cover_path_local=candidate, silent=True)
                         return candidate
 
+            # yt-dlp 失败或目录内无图片时的兜底：某些视频（尤其只有 vi_webp 缩略图的）
+            # 其 thumbnails 数组为空，--write-thumbnail 什么也不产出。此时直接从
+            # i.ytimg.com 按视频 ID 取标准尺寸封面。
+            downloaded = self._download_cover_by_video_id(task_id, task_dir, task_logger)
+            if downloaded:
+                update_task(task_id, cover_path_local=downloaded, silent=True)
+                return downloaded
+
             task_logger.warning("从 YouTube 重新采集封面未获取到文件")
         except Exception as e:
             task_logger.warning(f"重新采集封面时发生异常: {e}")
+        return ''
+
+    def _download_cover_by_video_id(self, task_id, task_dir, task_logger):
+        """按视频 ID 直接从 i.ytimg.com 下载封面。
+
+        用于 yt-dlp 的 --write-thumbnail 没有产出任何文件的场景：部分视频只有
+        vi_webp 缩略图，其 thumbnails 数组为空，yt-dlp 会静默跳过。
+        """
+        try:
+            task = get_task(task_id)
+            youtube_url = (task or {}).get('youtube_url', '') or ''
+            m = re.search(r'(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})', youtube_url)
+            if not m:
+                task_logger.warning("无法从 YouTube URL 解析视频 ID，跳过直接封面下载")
+                return ''
+            video_id = m.group(1)
+            if not task_dir or not os.path.isdir(task_dir):
+                return ''
+
+            import requests as _requests
+            target = os.path.join(task_dir, 'video.jpg')
+            candidates = [
+                f'https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg',
+                f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg',
+            ]
+            for url in candidates:
+                try:
+                    resp = _requests.get(url, timeout=30)
+                except Exception as exc:
+                    task_logger.warning(f"下载封面失败 {url}: {exc}")
+                    continue
+                if resp.status_code != 200 or len(resp.content) < 10000:
+                    continue
+                ok, safe_path = _is_within_downloads(target)
+                if not ok:
+                    return ''
+                with open(safe_path, 'wb') as fh:
+                    fh.write(resp.content)
+                task_logger.info(f"已按视频 ID 直接下载封面: {safe_path}")
+                return safe_path
+            task_logger.warning("i.ytimg.com 封面均不可用")
+        except Exception as exc:
+            task_logger.warning(f"按视频 ID 下载封面异常: {exc}")
         return ''
 
     def _translate_content(self, task_id, task_logger):
@@ -5774,7 +5961,10 @@ class TaskProcessor:
             for line_count in range(minimum_lines, maximum_lines + 1):
                 target_units = max(6.0, total_units / max(1, line_count))
 
-                @lru_cache(maxsize=None)
+                # maxsize 必须设上限：下面每轮 line_count 都会重建一个 solve，
+                # 而 solve 通过闭包引用自己形成环，缓存无法靠引用计数及时释放。
+                # 不设上限时缓存会一直堆到循环 GC 才回收，长段落反复分句就会无界增长。
+                @lru_cache(maxsize=2048)
                 def solve(start_idx, lines_left):
                     remaining_text = merged_text[points[start_idx]:].strip()
                     if not remaining_text:
@@ -5814,7 +6004,12 @@ class TaskProcessor:
 
                     return best_local
 
-                score, lines = solve(0, line_count)
+                # 用完立即清缓存：lines 是不可变 tuple，已持有生成好的字符串引用，
+                # cache_clear() 不会让结果失效；同时断开 solve 闭包环，让缓存即时释放。
+                try:
+                    score, lines = solve(0, line_count)
+                finally:
+                    solve.cache_clear()
                 if not lines:
                     continue
 
@@ -9420,7 +9615,16 @@ class TaskProcessor:
         
         # 获取封面处理模式
         cover_mode = self.config.get('COVER_PROCESSING_MODE', 'crop')
-        
+
+        # 投稿前敏感词替换（AcFun 与 B站 共用同一张替换表）
+        _sanitized = _sanitize_upload_fields(
+            self.config, task_logger,
+            title=title, description=description, tags=tags,
+        )
+        title = _sanitized.get('title', title)
+        description = _sanitized.get('description', description)
+        tags = _sanitized.get('tags', tags)
+
         # 检查必要参数
         missing_params = []
         if not video_path or not os.path.exists(video_path):
@@ -9530,6 +9734,53 @@ class TaskProcessor:
                 status=TASK_STATES['FAILED'],
                 error_message=f"上传异常: {str(e)}"
             )
+
+    def _upload_bilibili_with_retry(self, uploader, task_logger, **kwargs):
+        """调用 bilibili 上传，并对可恢复的失败自动重试。
+
+        - 网络抖动（curl 28 超时、连接重置）→ 快速重试。
+        - preupload 406（上传频率限流）→ 用更长的等待重试，避免继续撞墙。
+        - 账号级风控（-352 / 603 / cookie 失效）→ 不重试。
+        """
+        from modules.bilibili_uploader import _compact_exception_text
+
+        max_attempts = max(1, _as_int(self.config.get('UPLOAD_NETWORK_MAX_ATTEMPTS', 3), 3, minimum=1))
+        retry_delay = max(0, _as_int(self.config.get('UPLOAD_NETWORK_RETRY_DELAY', 15), 15, minimum=0))
+        throttle_delay = max(
+            0, _as_int(self.config.get('UPLOAD_THROTTLE_RETRY_DELAY', 180), 180, minimum=0)
+        )
+
+        last_result = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                success, result = uploader.upload_video(**kwargs)
+            except Exception as exc:
+                message = f"bilibili上传异常: {_compact_exception_text(str(exc))}"
+                if attempt >= max_attempts or not _is_retryable_upload_error(message):
+                    raise
+                success, result = False, message
+
+            if success:
+                return success, result
+
+            last_result = result
+            if attempt >= max_attempts or not _is_retryable_upload_error(result):
+                return success, result
+
+            # 限流场景需要更长冷却，否则重试仍会被 406 挡回
+            text = str(result).lower()
+            is_throttle = 'preupload' in text and '406' in text
+            wait_s = throttle_delay if is_throttle else retry_delay
+            task_logger.warning(
+                "bilibili上传失败（第 %d/%d 次，%s）：%s；%d 秒后重试",
+                attempt, max_attempts,
+                '限流冷却' if is_throttle else '网络重试',
+                _compact_exception_text(str(result)), wait_s,
+            )
+            if wait_s:
+                time.sleep(wait_s)
+
+        return False, last_result
 
     def _do_upload_to_bilibili(self, task_id, task_logger, subtitle_prepared=False):
         """实际执行上传到 Bilibili 的逻辑"""
@@ -9671,6 +9922,16 @@ class TaskProcessor:
         except Exception as e:
             task_logger.warning(f"校验 bilibili 分区列表失败，继续使用当前分区ID: {e}")
 
+        # 投稿前敏感词替换：B站会自行屏蔽并篡改标题（如「乳头」→「○头」），
+        # 主动替换成等价说法，避免平台侧改写影响曝光与一致性。
+        _sanitized = _sanitize_upload_fields(
+            self.config, task_logger,
+            title=title, description=description, tags=tags,
+        )
+        title = _sanitized.get('title', title)
+        description = _sanitized.get('description', description)
+        tags = _sanitized.get('tags', tags)
+
         missing_params = []
         if not video_path or not os.path.exists(video_path):
             missing_params.append("video_path (视频文件)")
@@ -9752,7 +10013,9 @@ class TaskProcessor:
                 last_progress_text = normalized_text
                 update_task(task_id, upload_progress=normalized_text, silent=True)
 
-            success, result = uploader.upload_video(
+            success, result = self._upload_bilibili_with_retry(
+                uploader,
+                task_logger,
                 video_file_path=video_path,
                 cover_file_path=cover_path,
                 title=title,

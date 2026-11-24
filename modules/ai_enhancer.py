@@ -8,6 +8,7 @@ import time
 import json
 import base64
 import traceback
+import unicodedata
 from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence
 from difflib import SequenceMatcher
 from logging.handlers import RotatingFileHandler
@@ -395,6 +396,33 @@ def _contains_promo_signal(text: str) -> bool:
             return True
     return False
 
+
+def _is_predominantly_cjk(text: str) -> bool:
+    """判断文本是否包含中文（用于豁免「与原文过相似」的误判）。
+
+    原文已是中文时，繁→简或基本不改动的输出属于正确翻译，不应判失败。
+    这里只要求**存在成规模的汉字**，不要求汉字占多数——标题常带品牌名与
+    分隔符（如「《愚者之夜》| 正式預告 | Netflix」），按占比算会误判为英文。
+    """
+    cjk = sum(1 for ch in str(text or "") if "\u4e00" <= ch <= "\u9fff")
+    return cjk >= 4
+
+
+def _block_information_length(text: str) -> int:
+    """按信息量估算段落长度：CJK 字符按 2 计，其余按 1 计。
+
+    原实现直接用 ``len(block) < 6``。对英文（``Music:`` = 6）刚好合适，但中文
+    一个汉字携带的信息量约等于两个拉丁字母，``歌词：`` 只有 4 个字符却完全
+    正常，会被误判为碎片段落，整条简介因此判为「不自然」。
+    """
+    total = 0
+    for ch in str(text or "").strip():
+        if ch.isspace():
+            continue
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
+
+
 def _is_natural_description(text: str, max_blocks: Optional[int] = 2) -> bool:
     blocks = _split_blocks(text)
     if not blocks:
@@ -405,7 +433,10 @@ def _is_natural_description(text: str, max_blocks: Optional[int] = 2) -> bool:
         return False
     if '►' in text:
         return False
-    if any(len(block.strip()) < 6 for block in blocks):
+    # 长度阈值按「信息量」算，不按字符数：中文段落 4 个字（如「歌词：」）已经
+    # 是正常的小标题，用英文的 6 字符下限会把它们误判成碎片，导致整条简介被
+    # 判为不自然、任务转入人工审核。
+    if any(_block_information_length(block) < 4 for block in blocks):
         return False
     return True
 
@@ -429,7 +460,12 @@ def _validate_output(
     src_norm = _normalize_for_similarity(src)
     out_norm = _normalize_for_similarity(out)
     if src_norm and out_norm:
-        if len(src_norm) >= 12 and len(out_norm) >= 8:
+        # 原文本身已是中文时，目标语言同为中文，输出与原文高度相似是**正确结果**
+        # （例如繁体《愚者之夜》→ 简体的字形差异极小）。此时不能用相似度判失败，
+        # 否则每条繁→简、或本就中文的标题都会被打回人工审核。
+        if _is_predominantly_cjk(src):
+            pass
+        elif len(src_norm) >= 12 and len(out_norm) >= 8:
             ratio = SequenceMatcher(None, src_norm, out_norm).ratio()
             if ratio >= 0.90:
                 reasons.append(f'too_similar:{ratio:.2f}')

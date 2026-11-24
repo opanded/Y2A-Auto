@@ -477,6 +477,28 @@ class YouTubeMonitor:
 
         return httplib2.Http(timeout=http_timeout, proxy_info=None)
 
+    def _drop_http_connections(self) -> None:
+        """丢弃 httplib2 里失效的 keep-alive 连接，保留客户端对象本身。
+
+        握手被中途打断后，缓存的 socket 可能处于半死状态；清掉缓存让下一次
+        请求重新建立干净连接，但不需要重建 discovery 客户端（那样会丢掉刚
+        建立好的可用连接，反而放大失败率）。
+        """
+        http_obj = getattr(self, 'youtube_http', None)
+        if http_obj is None:
+            return
+        try:
+            conns = getattr(http_obj, 'connections', None)
+            if isinstance(conns, dict):
+                for conn in list(conns.values()):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conns.clear()
+        except Exception as exc:
+            logger.debug("清理 HTTP 连接缓存失败: %s", exc)
+
     def _init_youtube_api(self, runtime_config: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """初始化 YouTube API，并显式控制是否走独立代理。"""
         if runtime_config is None:
@@ -496,11 +518,17 @@ class YouTubeMonitor:
 
         try:
             self.youtube_http = self._build_youtube_http(config)
+            # static_discovery=True：使用 googleapiclient 自带的 youtube.v3.json，
+            # 不再每次 build 都去拉 discovery/v1/apis/youtube/v3/rest。
+            # 国内网络下该 endpoint 的 SSL 握手有 ~30% 失败率，而 build() 拉取失败
+            # 会直接抛出，导致所有 API 调用在重试前就崩掉（表现为 100% 失败）。
             self.youtube = build(
                 'youtube',
                 'v3',
                 developerKey=self.api_key,
                 http=self.youtube_http,
+                cache_discovery=False,
+                static_discovery=True,
             )
             status_code = self._get_api_init_success_status()
             self._last_api_init_error = None
@@ -1372,22 +1400,37 @@ class YouTubeMonitor:
             # 根据频道模式调整获取数量
             channel_mode = config.get('channel_mode', 'latest')
             if channel_mode == 'historical':
-                # 历史搬运模式，获取更多视频，支持分页
+                # 历史搬运模式，分页遍历整个上传列表。
+                # 这里原本硬编码 500 条上限，对于 Aniplex 这类上万条视频的大频道
+                # 等于只能看到最近几条，老作品（如 2009 年的化物語）永远匹配不到。
+                # 改为可配置，默认 0 表示不设上限（由 published_after 时间窗自然收口）。
                 max_results_per_page = 50  # YouTube API单次最大50
-                max_total_videos = 500  # 最多检查500个视频
+                try:
+                    configured_cap = int(config.get('historical_max_videos') or 0)
+                except (TypeError, ValueError):
+                    configured_cap = 0
+                max_total_videos = configured_cap if configured_cap > 0 else None
             else:
                 # 最新跟进模式
                 max_results_per_page = config.get('latest_max_results', 20)
                 max_total_videos = max_results_per_page
-            
+
             # 分页获取播放列表中的视频
             all_playlist_items = []
             next_page_token = None
             videos_fetched = 0
-            
-            while videos_fetched < max_total_videos:
+            # 安全上限：防止极端情况下无限翻页（每次 50 条 → 10 万条封顶）
+            hard_cap = 100000
+
+            while (max_total_videos is None or videos_fetched < max_total_videos) \
+                    and videos_fetched < hard_cap:
                 # 计算本次请求的数量
-                current_page_size = min(max_results_per_page, max_total_videos - videos_fetched)
+                if max_total_videos is None:
+                    current_page_size = max_results_per_page
+                else:
+                    current_page_size = min(
+                        max_results_per_page, max_total_videos - videos_fetched
+                    )
                 
                 playlist_params = {
                     'part': 'snippet',
@@ -1448,13 +1491,29 @@ class YouTubeMonitor:
             if self.youtube is None:
                 logger.error(f"频道 {channel_id} YouTube API 对象为 None")
                 return []
-            videos_request = self.youtube.videos().list(
-                part='id,snippet,statistics,contentDetails,liveStreamingDetails',
-                id=','.join(video_ids)
-            )
-            videos_response = self._execute_with_retry(videos_request, f'videos.list (channel {channel_id})')
-            
-            videos = videos_response['items']
+            # videos.list 的 id 参数单次上限 50 个，超过会直接返回
+            # 400 invalidFilters。历史搬运模式一个频道常能翻出几百条，
+            # 必须分批请求，否则整步直接失败、筛选结果为空。
+            videos: List[Dict[str, Any]] = []
+            batch_size = 50
+            batches = [
+                video_ids[i:i + batch_size]
+                for i in range(0, len(video_ids), batch_size)
+            ]
+            if len(batches) > 1:
+                logger.info(
+                    f"频道 {channel_id} 共 {len(video_ids)} 个视频，"
+                    f"分 {len(batches)} 批请求详情"
+                )
+            for batch_index, batch_ids in enumerate(batches, 1):
+                videos_request = self.youtube.videos().list(
+                    part='id,snippet,statistics,contentDetails,liveStreamingDetails',
+                    id=','.join(batch_ids)
+                )
+                videos_response = self._execute_with_retry(
+                    videos_request, f'videos.list (channel {channel_id})'
+                )
+                videos.extend(videos_response.get('items', []))
             
             # 历史搬运模式需要按时间正序排列（从最老到最新）
             channel_mode = config.get('channel_mode', 'latest')
@@ -1525,7 +1584,7 @@ class YouTubeMonitor:
             return m.group(1)
         return None
 
-    def _execute_with_retry(self, request: Any, description: str, max_attempts: int = 3,
+    def _execute_with_retry(self, request: Any, description: str, max_attempts: int = 6,
                             backoff_seconds: float = 1.0, quota_consumer: Optional[Any] = None,
                             operation_type: str = 'other') -> Any:
         """对YouTube API请求执行带重试的调用，用于处理临时性网络/SSL问题。
@@ -1584,15 +1643,22 @@ class YouTubeMonitor:
                 else:
                     raise
             except ssl.SSLError as e:
-                # 记录并重试，同时尝试重建客户端
+                # SSL 握手失败（典型 UNEXPECTED_EOF_WHILE_READING）。
+                # 只丢弃失效连接、保留客户端对象：重建 build() 会把刚建立好的
+                # 连接缓存一起扔掉，下一次重试又要重新握手，等于每次都回到最易
+                # 失败的首次连接状态。实测同一连接建立后连续 7+ 次调用稳定成功。
                 last_exception = e
-                logger.warning(f"SSL错误，准备重试并重建API客户端: {str(e)}")
-                self._init_youtube_api()
+                logger.warning(f"SSL错误，丢弃失效连接后重试: {str(e)}")
+                self._drop_http_connections()
             except OSError as e:
                 # 网络层错误，重试
                 last_exception = e
+                self._drop_http_connections()
             attempt += 1
             sleep_time = backoff_seconds * (2 ** (attempt - 1))
+            # 上限 8 秒：SSL 抖动靠「快速多试」比「长时间等待」更有效，
+            # 无限指数退避只会让一轮 21 个频道的监控拖到几分钟以上。
+            sleep_time = min(sleep_time, 8.0)
             logger.warning(f"调用 {description} 失败（第 {attempt} 次），{type(last_exception).__name__}: {last_exception}，{sleep_time:.1f}s 后重试...")
             time.sleep(sleep_time)
         # 达到最大重试次数仍失败

@@ -203,6 +203,19 @@ DEFAULT_CONFIG = {
     # 并发控制配置
     "MAX_CONCURRENT_TASKS": 2,  # 最大并发任务数
     "MAX_CONCURRENT_UPLOADS": 1,  # 最大并发上传数
+    # 上传网络抖动重试：仅对超时/连接重置等传输层错误生效，业务错误不重试
+    "UPLOAD_NETWORK_MAX_ATTEMPTS": 3,  # 单次上传最多尝试次数（含首次）
+    "UPLOAD_NETWORK_RETRY_DELAY": 15,  # 重试间隔（秒）
+    # 上传频率限流（preupload 406）的冷却时间：比网络重试更长，避免继续撞风控
+    "UPLOAD_THROTTLE_RETRY_DELAY": 180,
+    # 投稿前敏感词替换：B站会自行屏蔽/篡改标题里的敏感词（如「乳头」→「○头」），
+    # 与其让平台事后改写、影响曝光，不如投稿前主动替换成等价说法。
+    # 格式：JSON 对象 {"原文": "替代词"}，按 key 长度降序匹配（长词优先）。
+    "SENSITIVE_WORD_REPLACE_ENABLED": True,
+    "SENSITIVE_WORD_REPLACE_MAP": (
+        '{"乳头":"〇头","乳首":"〇头","奶头":"〇头"}'
+    ),
+    "SENSITIVE_WORD_REPLACE_TARGETS": "title,description,tags",  # 生效字段
     "STUCK_TASK_CHECK_INTERVAL_SECONDS": 300,  # 自动扫描并恢复卡住任务的时间间隔（秒）
     # 视频转码相关（硬编默认输出 HEVC/H.265，CPU 保持 H.264）
     "VIDEO_ENCODER": "auto",  # auto/cpu/nvidia/intel/amd - 自动检测或指定编码器

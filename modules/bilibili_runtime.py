@@ -23,6 +23,19 @@ def configure_bilibili_runtime() -> bool:
         impersonate = os.environ.get("BILIBILI_IMPERSONATE", "chrome131").strip()
         if impersonate:
             request_settings.set("impersonate", impersonate)
+
+        # The SDK ships with a 30s default applied to every request, including
+        # each multipart upload chunk. Slow uplinks routinely exceed that on
+        # larger files, which surfaces as "curl: (28) Operation timed out".
+        raw_timeout = os.environ.get("BILIBILI_UPLOAD_TIMEOUT", "300").strip()
+        try:
+            timeout = float(raw_timeout)
+        except ValueError:
+            timeout = 300.0
+        if timeout > 0:
+            request_settings.set("timeout", timeout)
+            logger.info("bilibili-api 请求超时设置为 %.0f 秒", timeout)
+
         _INITIALIZED = True
         _LAST_ERROR = None
         return True
