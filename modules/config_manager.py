@@ -219,8 +219,13 @@ DEFAULT_CONFIG = {
     # 上传主动节流：上传信号量只限并发数，限不住「一条接一条」的发送速度。
     # 实测短间隔连发（最小 1 秒、中位 38 秒）约 24 条后即触发平台限流。
     "UPLOAD_PACE_ENABLED": True,
-    "UPLOAD_MIN_INTERVAL_SECONDS": 180,  # 两次上传之间的最小间隔（秒）
-    "UPLOAD_MAX_PER_HOUR": 10,  # 每小时最多上传条数，0 表示不限
+    # 自适应节奏：待上传积压超过阈值用保守档，否则用放宽档
+    "UPLOAD_PACE_ADAPTIVE": True,
+    "UPLOAD_PACE_BACKLOG_THRESHOLD": 5,  # 积压超过该值即切换保守档
+    "UPLOAD_MIN_INTERVAL_SECONDS": 600,  # 保守档：两次上传最小间隔（秒）
+    "UPLOAD_MAX_PER_HOUR": 3,  # 保守档：每小时最多条数
+    "UPLOAD_MIN_INTERVAL_SECONDS_FAST": 300,  # 放宽档：最小间隔
+    "UPLOAD_MAX_PER_HOUR_FAST": 6,  # 放宽档：每小时上限
     # 每日凌晨自动重投前一天遗留的投稿任务。平台日投稿配额按自然日重置，
     # 凌晨是唯一稳定恢复的窗口，不必依赖人工点「重试失败任务」。
     "DAILY_UPLOAD_RETRY_ENABLED": True,

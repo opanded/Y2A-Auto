@@ -2287,7 +2287,7 @@ def get_upload_pace_status(config=None):
         penalized_until = _upload_penalty_until
         factor = max(1, _upload_penalty_factor)
 
-    hourly_limit = _as_int(cfg.get('UPLOAD_MAX_PER_HOUR', 10), 10, minimum=0)
+    min_interval, hourly_limit = _resolve_pace_params(cfg)
     recent = [t for t in history if t > now - 3600]
 
     wait_s = _upload_pace_wait_seconds(cfg)
@@ -2295,8 +2295,9 @@ def get_upload_pace_status(config=None):
 
     return {
         'enabled': True,
-        'min_interval': _as_int(cfg.get('UPLOAD_MIN_INTERVAL_SECONDS', 180), 180, minimum=0),
+        'min_interval': min_interval,
         'hourly_limit': hourly_limit,
+        'adaptive': _as_bool(cfg.get('UPLOAD_PACE_ADAPTIVE', True)),
         'used_last_hour': len(recent),
         'remaining_this_hour': max(0, hourly_limit - len(recent)) if hourly_limit else None,
         'penalty_active': penalized_until > now,
@@ -2849,13 +2850,53 @@ def note_upload_rate_limited(config=None):
         )
 
 
+def _resolve_pace_params(config):
+    """按待上传队列长度决定本次采用的上传节奏。
+
+    队列长 = 有大批存量要消化，用保守节奏避免撞日配额；
+    队列短 = 日常增量，可以放宽。阈值与两档参数均可配置。
+    """
+    if not _as_bool(config.get('UPLOAD_PACE_ENABLED', True)):
+        return 0, 0
+
+    base_interval = _as_int(config.get('UPLOAD_MIN_INTERVAL_SECONDS', 600), 600, minimum=0)
+    base_hourly = _as_int(config.get('UPLOAD_MAX_PER_HOUR', 3), 3, minimum=0)
+
+    if not _as_bool(config.get('UPLOAD_PACE_ADAPTIVE', True)):
+        return base_interval, base_hourly
+
+    # 队列长度：待上传 + 冷却中 + 人工审核待处理的，都算「还没投出去的」
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            backlog = conn.execute(
+                """
+                SELECT COUNT(*) FROM tasks
+                WHERE status IN ('ready_for_upload', 'awaiting_manual_review', 'pending')
+                """
+            ).fetchone()[0]
+    except Exception:
+        return base_interval, base_hourly
+
+    threshold = _as_int(config.get('UPLOAD_PACE_BACKLOG_THRESHOLD', 5), 5, minimum=1)
+
+    if backlog > threshold:
+        # 存量多：保守档
+        return base_interval, base_hourly
+
+    # 存量少：放宽档
+    fast_interval = _as_int(
+        config.get('UPLOAD_MIN_INTERVAL_SECONDS_FAST', 300), 300, minimum=0
+    )
+    fast_hourly = _as_int(config.get('UPLOAD_MAX_PER_HOUR_FAST', 6), 6, minimum=0)
+    return fast_interval, fast_hourly
+
+
 def _upload_pace_wait_seconds(config):
     """返回为了满足节奏约束，本次上传还需要等待多少秒（0 表示可立即上传）。"""
     if not _as_bool(config.get('UPLOAD_PACE_ENABLED', True)):
         return 0.0
 
-    min_interval = _as_int(config.get('UPLOAD_MIN_INTERVAL_SECONDS', 180), 180, minimum=0)
-    hourly_limit = _as_int(config.get('UPLOAD_MAX_PER_HOUR', 10), 10, minimum=0)
+    min_interval, hourly_limit = _resolve_pace_params(config)
 
     now = time.time()
     with _upload_pace_lock:

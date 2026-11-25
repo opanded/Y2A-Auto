@@ -31,6 +31,7 @@ from modules.task_manager import (  # noqa: E402
     get_task_status_counts,
     get_upload_pace_status,
     requeue_yesterday_upload_failures,
+    request_task_cancel,
 )
 from modules.acfun_auth import AcfunQrLoginSession
 from modules.bilibili_auth import BilibiliQrLoginSession
@@ -1684,6 +1685,35 @@ def task_status_display(status):
     }
     return status_map.get(status, status)
 
+def task_failure_category(task):
+    """把失败原因归类，供界面提示「重试是否有用」。
+
+    返回 (阶段标签, 是否可重试, 颜色)。
+    """
+    msg = str((task or {}).get('error_message') or '')
+    cat = str((task or {}).get('error_category') or '')
+    if not msg and not cat:
+        return ('', True, 'secondary')
+
+    if cat == 'user_aborted' or '用户主动中止' in msg or '用户主动放弃' in msg:
+        return ('人工中止', False, 'secondary')
+    if 'not available in your count' in msg or '地区限制' in msg or 'geo' in cat:
+        return ('地区限制', False, 'secondary')
+    if 'this video is private' in msg or 'has been removed' in msg or 'unavailable' in msg:
+        return ('视频不可用', False, 'secondary')
+    if '下载' in msg:
+        return ('下载失败', True, 'warning')
+    if '翻译' in msg or '元数据' in msg or '简介' in msg:
+        return ('AI 处理失败', True, 'warning')
+    if '137022' in msg or '投稿过于频繁' in msg or '限流' in msg:
+        return ('平台限流', True, 'warning')
+    if '-352' in msg or '603' in msg or '风控' in msg:
+        return ('账号风控', True, 'danger')
+    if '上传' in msg:
+        return ('上传失败', True, 'danger')
+    return ('未知原因', True, 'danger')
+
+
 def task_status_color(status):
     """将任务状态代码转换为显示颜色"""
     color_map = {
@@ -1866,6 +1896,7 @@ def get_aliyun_label_chinese(label_value):
 app.jinja_env.globals.update(
     task_status_display=task_status_display,
     task_status_color=task_status_color,
+    task_failure_category=task_failure_category,
     get_partition_name=get_partition_name,
     parse_json=parse_json,
     get_aliyun_label_chinese=get_aliyun_label_chinese, # 添加新的辅助函数
@@ -2844,19 +2875,43 @@ def reset_stuck_tasks_route():
 @app.route('/tasks/<task_id>/abandon', methods=['POST'])
 @login_required
 def abandon_task_route(task_id):
-    """放弃任务"""
+    """中止 / 放弃任务。
+
+    - 运行中的任务：先置取消标志，工作线程在检查点自行退出；
+    - 未运行的任务：直接置为失败（人工终止），不再参与自动重试。
+    """
+    task = get_task(task_id)
+    if not task:
+        flash('任务不存在', 'danger')
+        return redirect(url_for('tasks'))
+
     delete_files = request.form.get('delete_files', 'true').lower() in ('true', 'yes', '1', 'on')
-    
-    # 更新任务状态为失败
-    update_task(task_id, status=TASK_STATES['FAILED'], error_message="用户主动放弃任务")
-    
+
+    # 通知后台线程停止（yt-dlp 子进程、字幕翻译循环等都会检查该标志）
+    try:
+        request_task_cancel(task_id)
+    except Exception as exc:
+        logger.warning("请求取消任务 %s 失败: %s", task_id, exc)
+
+    update_task(
+        task_id,
+        status=TASK_STATES['FAILED'],
+        error_message="用户主动中止任务",
+        error_category='user_aborted',
+        retry_after=None,
+        upload_progress=None,
+    )
+
     if delete_files:
-        # 删除任务文件
-        from modules.task_manager import delete_task_files
-        delete_task_files(task_id)
-    
-    flash('任务已废弃', 'success')
-    return redirect(url_for('tasks'))
+        try:
+            from modules.task_manager import delete_task_files
+            delete_task_files(task_id)
+        except Exception as exc:
+            logger.warning("中止任务时删除文件失败 %s: %s", task_id, exc)
+
+    flash('任务已中止' + ('，本地文件已删除' if delete_files else ''), 'success')
+    back = request.form.get('back')
+    return redirect(back or url_for('tasks'))
 
 # 系统健康检查辅助函数
 

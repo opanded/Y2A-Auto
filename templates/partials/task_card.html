@@ -306,15 +306,51 @@
         </div>
 
         <div class="task-actions mt-3 d-grid gap-2 task-actions-grid-2">
-            {% if task.status == 'awaiting_manual_review' %}
-                <a href="{{ url_for('review_task', task_id=task.id) }}" class="btn btn-sm btn-warning"><i class="bi bi-eye me-1"></i> 审核</a>
-            {% elif task.status == 'pending' or task.status == 'failed' %}
-                <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
-                    <button type="submit" class="btn btn-sm btn-primary w-100"><i class="bi bi-play-fill me-1"></i> 开始</button>
+            {% if task.status in ('downloading', 'downloaded', 'asr_transcribing',
+                                  'translating_subtitle', 'encoding_video', 'translating',
+                                  'tagging', 'partitioning', 'moderating', 'uploading',
+                                  'fetching_info', 'info_fetched') %}
+                <form method="post" action="{{ url_for('abandon_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                    <input type="hidden" name="delete_files" value="false">
+                    <input type="hidden" name="back" value="{{ request.full_path }}">
+                    <button type="submit" class="btn btn-sm btn-outline-secondary w-100"
+                            onclick="return confirm('确定中止该任务？')">
+                        <i class="bi bi-stop-circle me-1"></i> 中止
+                    </button>
                 </form>
+            {% elif task.status == 'awaiting_manual_review' %}
+                <a href="{{ url_for('review_task', task_id=task.id) }}" class="btn btn-sm btn-warning"><i class="bi bi-eye me-1"></i> 审核</a>
+            {% elif task.status == 'pending' %}
+                {% if task.retry_after %}
+                    <button type="button" class="btn btn-sm btn-outline-secondary w-100" disabled>
+                        <i class="bi bi-hourglass me-1"></i> 等待中
+                    </button>
+                {% else %}
+                    <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                        <button type="submit" class="btn btn-sm btn-primary w-100"><i class="bi bi-play-fill me-1"></i> 开始</button>
+                    </form>
+                {% endif %}
+            {% elif task.status == 'failed' %}
+                {% set _cat, can_retry, _color = task_failure_category(task) %}
+                {% if can_retry %}
+                    <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                        <button type="submit" class="btn btn-sm btn-primary w-100"><i class="bi bi-arrow-repeat me-1"></i> 重试</button>
+                    </form>
+                {% else %}
+                    <button type="button" class="btn btn-sm btn-outline-secondary w-100" disabled>
+                        <i class="bi bi-slash-circle me-1"></i> 不可重试
+                    </button>
+                {% endif %}
             {% elif task.status == 'ready_for_upload' %}
                 <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
                     <button type="submit" class="btn btn-sm btn-success w-100"><i class="bi bi-cloud-upload me-1"></i> 上传到{{ '双平台' if target == 'both' else ('bilibili' if target == 'bilibili' else 'AcFun') }}</button>
+                </form>
+            {% elif task.status == 'completed' %}
+                <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                    <button type="submit" class="btn btn-sm btn-outline-success w-100"
+                            onclick="return confirm('该任务已上传成功，确定再次提交？可能产生重复稿件。')">
+                        <i class="bi bi-arrow-clockwise me-1"></i> 重新上传
+                    </button>
                 </form>
             {% endif %}
             <a href="{{ url_for('edit_task', task_id=task.id) }}" class="btn btn-sm btn-outline-primary"><i class="bi bi-pencil me-1"></i> 编辑</a>
