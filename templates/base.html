@@ -10,8 +10,27 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='lib/icons/bootstrap-icons.css') }}">
     <!-- 自定义样式 -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <!-- 深色主题（Bootstrap 5.1 无原生深色模式，用覆盖 CSS 变量实现） -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-dark.css') }}">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/favicon.png') }}">
     <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
+    <script>
+    // 渲染前先定好主题，避免深色用户看到白屏闪一下。
+    // 优先级：本地记录 > 系统偏好。
+    (function () {
+        try {
+            var saved = localStorage.getItem('y2a-theme');
+            var prefersDark = window.matchMedia
+                && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            var theme = (saved === 'dark' || saved === 'light')
+                ? saved
+                : (prefersDark ? 'dark' : 'light');
+            document.documentElement.setAttribute('data-theme', theme);
+        } catch (e) {
+            document.documentElement.setAttribute('data-theme', 'light');
+        }
+    })();
+    </script>
     {% block extra_css %}{% endblock %}
 </head>
 <body>
@@ -22,6 +41,10 @@
                     <span>Y2A-Auto</span>
                 </a>
                 <div class="navbar-utility ms-auto d-flex align-items-center gap-2">
+                    <button class="theme-toggle" type="button" id="themeToggle"
+                            aria-label="切换深色模式" title="切换深色模式">
+                        <i class="bi bi-moon-stars" id="themeToggleIcon" aria-hidden="true"></i>
+                    </button>
                     {% if show_logout_in_nav %}
                         <a class="btn btn-outline-light btn-sm navbar-logout-btn" href="{{ url_for('logout') }}">
                             <i class="bi bi-box-arrow-right"></i>
@@ -108,6 +131,45 @@
     <script src="{{ url_for('static', filename='lib/bootstrap/bootstrap.bundle.min.js') }}"></script>
     <!-- 自定义JS -->
     <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script>
+    // 主题切换：写入 localStorage 并即时更新图标。
+    (function () {
+        var root = document.documentElement;
+        var btn = document.getElementById('themeToggle');
+        var icon = document.getElementById('themeToggleIcon');
+        if (!btn || !icon) return;
+
+        function syncIcon() {
+            var dark = root.getAttribute('data-theme') === 'dark';
+            icon.className = dark ? 'bi bi-sun' : 'bi bi-moon-stars';
+            btn.setAttribute('aria-label', dark ? '切换到浅色模式' : '切换到深色模式');
+            btn.setAttribute('title', dark ? '切换到浅色模式' : '切换到深色模式');
+        }
+
+        btn.addEventListener('click', function () {
+            var next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+            root.setAttribute('data-theme', next);
+            try { localStorage.setItem('y2a-theme', next); } catch (e) {}
+            syncIcon();
+        });
+
+        syncIcon();
+
+        // 用户没手动选过时，跟随系统主题变化
+        if (window.matchMedia) {
+            var mq = window.matchMedia('(prefers-color-scheme: dark)');
+            var onChange = function (e) {
+                var saved = null;
+                try { saved = localStorage.getItem('y2a-theme'); } catch (err) {}
+                if (saved === 'dark' || saved === 'light') return;
+                root.setAttribute('data-theme', e.matches ? 'dark' : 'light');
+                syncIcon();
+            };
+            if (mq.addEventListener) mq.addEventListener('change', onChange);
+            else if (mq.addListener) mq.addListener(onChange);
+        }
+    })();
+    </script>
 
     {% block extra_js %}{% endblock %}
 </body>

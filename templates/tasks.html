@@ -447,9 +447,9 @@
     font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 0.92rem;
     line-height: 1.55;
-    color: #212529;
-    background: #f8f9fa;
-    border: 1px solid #e9ecef;
+    color: var(--y2a-text, #212529);
+    background: var(--y2a-bg-subtle, #f8f9fa);
+    border: 1px solid var(--y2a-border, #e9ecef);
     border-radius: 0.5rem;
     padding: 1rem;
 }
@@ -554,10 +554,16 @@ tr.status-failed td { background-color: rgba(220,53,69,0.03); }
 tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
 
 /* 去边框现代化风格 */
+/* 行底色用变量：深色主题下若仍写死 #fff，整行会变成白底黑字翻白 */
 .modern-list { border: none; box-shadow: none; }
 .modern-table table { border-collapse: separate; border-spacing: 0 4px; }
-.modern-table table tbody tr { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-.modern-table table thead th { border-bottom: 1px solid #e9ecef; }
+.modern-table table tbody tr {
+    background: var(--y2a-bg-elevated, #fff);
+    box-shadow: 0 1px 3px var(--y2a-shadow, rgba(0,0,0,0.06));
+}
+.modern-table table thead th {
+    border-bottom: 1px solid var(--y2a-border, #e9ecef);
+}
 .modern-table table tbody tr td { border-top: none; }
 .modern-table .table-hover tbody tr:hover { background: rgba(13,110,253,0.04); }
 .modern-table .table { background: transparent; }
