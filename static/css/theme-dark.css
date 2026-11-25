@@ -237,6 +237,27 @@
     border-color: var(--y2a-border);
 }
 
+/* Bootstrap 的工具类在深色下不会自动跟随，需显式压暗。
+   .bg-light / .bg-white 在深色页面上会让整块区域发白。 */
+[data-theme="dark"] .bg-light,
+[data-theme="dark"] .bg-white,
+[data-theme="dark"] .card-header.bg-light,
+[data-theme="dark"] .table thead.table-light {
+    background-color: var(--y2a-bg-subtle) !important;
+    color: var(--y2a-text) !important;
+}
+
+[data-theme="dark"] .bg-light *,
+[data-theme="dark"] .card-header.bg-light * {
+    color: inherit;
+}
+
+/* 反向：浅色工具类里的强调文字保持原色 */
+[data-theme="dark"] .bg-light .text-primary,
+[data-theme="dark"] .card-header.bg-light .text-primary {
+    color: var(--bs-link-color) !important;
+}
+
 /* 项目自绘的卡片（设置页 / 任务卡） */
 [data-theme="dark"] .settings-card,
 [data-theme="dark"] .task-card,

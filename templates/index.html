@@ -18,10 +18,10 @@
     </div>
 </div>
 
-<!-- KPI cards -->
+<!-- KPI cards：整卡可点，直接落到已筛选的任务列表 -->
 <div class="row g-3 mt-2">
     <div class="col-6 col-md-3">
-        <div class="card h-100">
+        <a class="card h-100 kpi-link" href="{{ url_for('tasks', status='done') }}" title="查看已完成任务">
             <div class="card-body">
                 <div class="d-flex align-items-center justify-content-between">
                     <div>
@@ -31,10 +31,10 @@
                     <span class="home-kpi-icon success"><i class="bi bi-patch-check-fill"></i></span>
                 </div>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100">
+        <a class="card h-100 kpi-link" href="{{ url_for('tasks', status='problem') }}" title="查看失败任务，可直接重试">
             <div class="card-body">
                 <div class="d-flex align-items-center justify-content-between">
                     <div>
@@ -44,10 +44,10 @@
                     <span class="home-kpi-icon danger"><i class="bi bi-shield-x"></i></span>
                 </div>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100">
+        <a class="card h-100 kpi-link" href="{{ url_for('tasks') }}" title="查看全部任务">
             <div class="card-body">
                 <div class="d-flex align-items-center justify-content-between">
                     <div>
@@ -57,10 +57,10 @@
                     <span class="home-kpi-icon primary"><i class="bi bi-node-plus"></i></span>
                 </div>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100">
+        <a class="card h-100 kpi-link" href="{{ url_for('tasks', status='in_progress') }}" title="查看处理中的任务，可中止">
             <div class="card-body">
                 <div class="d-flex align-items-center justify-content-between">
                     <div>
@@ -70,14 +70,15 @@
                     <span class="home-kpi-icon info"><i class="bi bi-lightning-charge"></i></span>
                 </div>
             </div>
-        </div>
+        </a>
     </div>
 </div>
 
 <!-- Queues -->
 <div class="row g-3 mt-1">
     <div class="col-6 col-md-3">
-        <div class="card h-100 queue-stat-card">
+        <a class="card h-100 queue-stat-card kpi-link"
+           href="{{ url_for('manual_review') }}" title="前往人工审核，逐条确认后上传">
             <div class="card-body">
                 <div>
                     <div class="text-muted small">待审核</div>
@@ -85,10 +86,11 @@
                 </div>
                 <span class="queue-stat-icon"><i class="bi bi-hourglass-split"></i></span>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100 queue-stat-card">
+        <a class="card h-100 queue-stat-card kpi-link"
+           href="{{ url_for('tasks', status='in_progress') }}" title="查看等待处理的任务">
             <div class="card-body">
                 <div>
                     <div class="text-muted small">等待处理</div>
@@ -96,10 +98,11 @@
                 </div>
                 <span class="queue-stat-icon"><i class="bi bi-list-ul"></i></span>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100 queue-stat-card">
+        <a class="card h-100 queue-stat-card kpi-link"
+           href="{{ url_for('tasks', status='upload_pending') }}" title="查看待上传任务，可批量上传">
             <div class="card-body">
                 <div>
                     <div class="text-muted small">准备上传</div>
@@ -107,10 +110,11 @@
                 </div>
                 <span class="queue-stat-icon"><i class="bi bi-cloud-arrow-up"></i></span>
             </div>
-        </div>
+        </a>
     </div>
     <div class="col-6 col-md-3">
-        <div class="card h-100 queue-stat-card">
+        <a class="card h-100 queue-stat-card kpi-link"
+           href="{{ url_for('tasks', status='problem') }}" title="查看失败任务，可批量重试">
             <div class="card-body">
                 <div>
                     <div class="text-muted small">失败总数</div>
@@ -118,7 +122,7 @@
                 </div>
                 <span class="queue-stat-icon"><i class="bi bi-bug"></i></span>
             </div>
-        </div>
+        </a>
     </div>
 </div>
 
@@ -133,7 +137,7 @@
     <div class="card-body p-0">
         {% if recent_tasks %}
         <div class="table-responsive">
-            <table class="table table-hover align-middle mb-0">
+            <table class="table table-hover align-middle mb-0 recent-activity-table">
                 <thead class="table-light">
                     <tr>
                         <th class="col-narrow">#</th>
@@ -145,7 +149,9 @@
                 </thead>
                 <tbody>
                     {% for t in recent_tasks %}
-                    <tr>
+                    {# 整行可点：直接进该任务的编辑/详情页，省去「去任务页再找这一条」 #}
+                    <tr class="task-row-link" data-href="{{ url_for('edit_task', task_id=t.id) }}"
+                        role="link" tabindex="0">
                         <td class="text-monospace">{{ t.id[:6] }}…</td>
                         <td class="title-clamp title-clamp-2">{{ t.title }}</td>
                         <td class="text-center"><span class="badge bg-{{ task_status_color(t.status) }}">{{ task_status_display(t.status) }}</span></td>
@@ -224,6 +230,75 @@
 <style>
     .title-clamp-2 { -webkit-line-clamp: 2; line-clamp: 2; max-height: 2.8em; }
     .col-narrow { width: 32px; }
+
+    /* 可点击的 KPI / 队列卡：保持卡片外观，加悬停反馈表明可点 */
+    .kpi-link {
+        display: block;
+        color: inherit;
+        text-decoration: none;
+        transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+    }
+
+    .kpi-link:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 20px var(--y2a-shadow, rgba(13, 110, 253, .12));
+        border-color: var(--bs-primary-border-subtle, #9ec5fe);
+        color: inherit;
+    }
+
+    .kpi-link:focus-visible {
+        outline: 2px solid var(--bs-primary);
+        outline-offset: 2px;
+    }
+
+    .kpi-link .card-body { position: relative; }
+
+    /* 悬停时在右下角浮出「查看」提示 */
+    .kpi-link::after {
+        content: '查看 →';
+        position: absolute;
+        right: .85rem;
+        bottom: .6rem;
+        font-size: .75rem;
+        color: var(--bs-primary);
+        opacity: 0;
+        transition: opacity .15s ease;
+    }
+
+    .kpi-link:hover::after { opacity: 1; }
+
+    /* 最近动态整行可点 */
+    .task-row-link { cursor: pointer; }
+
+    .task-row-link:hover { background-color: var(--bs-tertiary-bg, #f8f9fa); }
+
+    .task-row-link:focus-visible {
+        outline: 2px solid var(--bs-primary);
+        outline-offset: -2px;
+    }
+
+    /* 深色下「查看」提示的悬浮位置需要压暗阴影 */
+    [data-theme="dark"] .kpi-link:hover {
+        box-shadow: 0 8px 20px rgba(0, 0, 0, .5);
+        border-color: #3d6aa8;
+    }
+
+    /* 手机窄屏：最近动态表头文字会被挤成竖排，改为横向滚动并给足列宽 */
+    @media (max-width: 575.98px) {
+        .recent-activity-table {
+            min-width: 560px;
+        }
+
+        .recent-activity-table th,
+        .recent-activity-table td {
+            white-space: nowrap;
+        }
+
+        .recent-activity-table td.title-clamp {
+            white-space: normal;
+            min-width: 160px;
+        }
+    }
 </style>
 {% endblock %}
 
@@ -234,5 +309,26 @@
         try{const d=new Date(dt);if(isNaN(d.getTime()))return dt;const n=new Date();const ms=n-d;const m=Math.floor(ms/60000);const h=Math.floor(ms/3600000);const days=Math.floor(ms/86400000);if(m<5)return '刚刚';if(m<60)return m+'分钟前';if(h<24&&d.toDateString()===n.toDateString())return h+'小时前';if(days===1) return '昨天 '+d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});if(days<7) return days+'天前';if(d.getFullYear()===n.getFullYear()) return d.toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit'})+' '+d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});return d.toLocaleDateString('zh-CN');}catch(e){return dt}}
     function updateTimes(){document.querySelectorAll('.task-datetime').forEach(el=>{const v=el.getAttribute('data-datetime');if(v){el.textContent=formatLocal(v);el.title=new Date(v).toLocaleString('zh-CN')}})}
     document.addEventListener('DOMContentLoaded',()=>{updateTimes();setInterval(updateTimes,60000)});
+
+    // 最近动态整行点击跳转。点击行内已有链接（如 BV 号）时不拦截，
+    // 否则用户想开视频页会被带走。
+    document.addEventListener('DOMContentLoaded', function () {
+        document.querySelectorAll('tr.task-row-link').forEach(function (tr) {
+            function go() {
+                var href = tr.getAttribute('data-href');
+                if (href) window.location.href = href;
+            }
+            tr.addEventListener('click', function (e) {
+                if (e.target.closest('a')) return;
+                go();
+            });
+            tr.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    go();
+                }
+            });
+        });
+    });
 </script>
 {% endblock %}
