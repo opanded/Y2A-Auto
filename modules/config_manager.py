@@ -208,6 +208,11 @@ DEFAULT_CONFIG = {
     "UPLOAD_NETWORK_RETRY_DELAY": 15,  # 重试间隔（秒）
     # 上传频率限流（preupload 406）的冷却时间：比网络重试更长，避免继续撞风控
     "UPLOAD_THROTTLE_RETRY_DELAY": 180,
+    # 平台级限流（如 B站 137022「投稿过于频繁」）的退避重试。
+    # 这类限制来自「待审稿件堆积」，分钟级等待无效，需要小时级冷却。
+    "UPLOAD_RATE_LIMIT_RETRY_ENABLED": True,
+    "UPLOAD_RATE_LIMIT_RETRY_MINUTES": 120,  # 冷却时长（分钟）
+    "UPLOAD_RATE_LIMIT_MAX_RETRIES": 5,  # 最多退避重试轮数，0 表示不限
     # 投稿前敏感词替换：B站会自行屏蔽/篡改标题里的敏感词（如「乳头」→「○头」），
     # 与其让平台事后改写、影响曝光，不如投稿前主动替换成等价说法。
     # 格式：JSON 对象 {"原文": "替代词"}，按 key 长度降序匹配（长词优先）。

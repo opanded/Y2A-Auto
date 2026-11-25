@@ -794,6 +794,114 @@ def _is_permanent_download_failure(error_message) -> bool:
     return any(marker in text for marker in permanent_markers)
 
 
+def _is_platform_rate_limit_error(result) -> bool:
+    """判断是否为平台级投稿限流（需要小时级冷却，而非秒级重试）。
+
+    B站 137022「投稿过于频繁」来自待审稿件堆积，分钟内重试必然继续失败，
+    必须让任务进入延迟队列，等冷却窗口过去再自动重试。
+    """
+    text = str(result or '')
+    if not text:
+        return False
+    markers = (
+        '137022',              # 投稿过于频繁
+        '投稿过于频繁',
+        '投稿限制',
+        '频繁',
+    )
+    # 只认明确的上传阶段限流，避免误判其它含「频繁」字样的错误
+    if '137022' in text or '投稿过于频繁' in text or '投稿限制' in text:
+        return True
+    return '上传' in text and any(m in text for m in markers)
+
+
+def _compute_retry_after(minutes: int) -> str:
+    """返回从现在起 N 分钟后的时间戳（与 DB 内其它时间字段同格式）。"""
+    return (datetime.now() + timedelta(minutes=max(1, int(minutes)))).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _is_retry_after_reached(retry_after) -> bool:
+    """判断 retry_after 是否已到期。空值视为「无延迟」，立即可跑。"""
+    raw = str(retry_after or '').strip()
+    if not raw:
+        return True
+    try:
+        due = datetime.strptime(raw, '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return True
+    return datetime.now() >= due
+
+
+def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None):
+    """把因平台限流失败的任务排入延迟重试队列。
+
+    返回 True 表示已排入（任务保持 PENDING 并写入 retry_after），
+    返回 False 表示不启用延迟重试，调用方应维持原有失败处理。
+    """
+    cfg = config or {}
+    if not _as_bool(cfg.get('UPLOAD_RATE_LIMIT_RETRY_ENABLED', True)):
+        return False
+    if not _is_platform_rate_limit_error(result):
+        return False
+
+    minutes = _as_int(cfg.get('UPLOAD_RATE_LIMIT_RETRY_MINUTES', 120), 120, minimum=1)
+    max_retries = _as_int(cfg.get('UPLOAD_RATE_LIMIT_MAX_RETRIES', 5), 5, minimum=0)
+    if max_retries:
+        attempts = _get_rate_limit_retry_count(task_id)
+        if attempts >= max_retries:
+            if logger_obj:
+                logger_obj.warning(
+                    "平台限流重试已达上限 %d 次，保留失败状态交由人工处理", max_retries
+                )
+            return False
+
+    retry_after = _compute_retry_after(minutes)
+    _bump_rate_limit_retry_count(task_id)
+    update_task(
+        task_id,
+        status=TASK_STATES['PENDING'],
+        error_message=f"平台限流，已排队等待重试（{minutes} 分钟后）",
+        retry_after=retry_after,
+        upload_progress=None,
+        silent=True,
+    )
+    if logger_obj:
+        logger_obj.warning(
+            "平台限流：任务已排入延迟队列，将在 %s（%d 分钟后）自动重试", retry_after, minutes
+        )
+    return True
+
+
+def _get_rate_limit_retry_count(task_id) -> int:
+    """读取任务已发生的限流退避次数，存放在 error_category 里（复用现有字段）。"""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                "SELECT error_category FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if not row or not row[0]:
+            return 0
+        raw = str(row[0])
+        if raw.startswith('rate_limit_retry:'):
+            return int(raw.split(':', 1)[1] or 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _bump_rate_limit_retry_count(task_id) -> None:
+    try:
+        count = _get_rate_limit_retry_count(task_id) + 1
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE tasks SET error_category = ? WHERE id = ?",
+                (f'rate_limit_retry:{count}', task_id),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _is_retryable_upload_error(result) -> bool:
     """判断上传失败是否值得重试。
 
@@ -1759,6 +1867,14 @@ def init_db():
             logger.info("数据库升级：添加subtitle_quality_state字段")
             conn.commit()
 
+        # 延迟重试：记录「最早可再次尝试」的时间戳（'YYYY-MM-DD HH:MM:SS'）。
+        # 平台限流（B站 137022 投稿过于频繁）靠立即重试无法恢复，需要一个可持久化
+        # 的冷却时间；进程重启后依然有效，也不会阻塞工作线程。
+        if 'retry_after' not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN retry_after TEXT")
+            logger.info("数据库升级：添加retry_after字段")
+            conn.commit()
+
         # 数据迁移：将 error_message 中纯 ASR/VAD 警告 token 挪至 asr_warning_message，清空 error_message
         cursor.execute(
             "SELECT 1 FROM schema_migrations WHERE migration_key = ? LIMIT 1",
@@ -1939,6 +2055,7 @@ def update_task(task_id, silent=False, **kwargs):
         'moderation_result': 'moderation_result = ?',
         'error_message': 'error_message = ?',
         'error_category': 'error_category = ?',
+        'retry_after': 'retry_after = ?',
         'pipeline_checkpoint': 'pipeline_checkpoint = ?',
         'upload_progress': 'upload_progress = ?',
         'acfun_upload_response': 'acfun_upload_response = ?',
@@ -3182,6 +3299,40 @@ class TaskProcessor:
             pending_tasks = get_tasks_by_status(TASK_STATES['PENDING'])
             active_task_ids = _get_active_task_ids()
             pending_tasks = [task for task in pending_tasks if task.get('id') not in active_task_ids]
+
+            # 延迟重试：跳过冷却未到期的任务（retry_after 在将来）。
+            # 这批任务由平台限流触发，提前启动只会再撞一次限流。
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            deferred_tasks = [
+                task for task in pending_tasks
+                if not _is_retry_after_reached(task.get('retry_after'))
+            ]
+            if deferred_tasks:
+                pending_tasks = [
+                    task for task in pending_tasks
+                    if _is_retry_after_reached(task.get('retry_after'))
+                ]
+                next_due = min(
+                    str(t.get('retry_after') or '') for t in deferred_tasks
+                )
+                # 每 30 秒扫描一次，同样的冷却提示会刷屏；只在「冷却集合变化」
+                # 或「跨过整 10 分钟」时打一条，兼顾可观测性与日志体积。
+                signature = f"{len(deferred_tasks)}|{next_due}"
+                last_sig = getattr(self, '_last_deferred_log', None)
+                last_ts = getattr(self, '_last_deferred_log_at', None)
+                now_dt = datetime.now()
+                should_log = (
+                    signature != last_sig
+                    or last_ts is None
+                    or (now_dt - last_ts).total_seconds() >= 600
+                )
+                if should_log:
+                    logger.info(
+                        "有 %d 个任务处于限流冷却中，最早 %s 可重试（当前 %s）",
+                        len(deferred_tasks), next_due, now_str,
+                    )
+                    self._last_deferred_log = signature
+                    self._last_deferred_log_at = now_dt
             
             if not pending_tasks:
                 if active_task_ids:
@@ -10056,6 +10207,10 @@ class TaskProcessor:
                     task_logger.warning(f"上传后删除本地文件失败（不影响已完成的 B 站上传）: {_e}")
             else:
                 task_logger.error(f"bilibili上传失败: {result}")
+                # 平台级限流（137022 投稿过于频繁）无法靠秒级重试恢复：
+                # 排入延迟队列，到点后由 pending 扫描器自动重新上传。
+                if _schedule_rate_limit_retry(task_id, task_logger, result, self.config):
+                    return
                 update_task(
                     task_id,
                     status=TASK_STATES['FAILED'],
