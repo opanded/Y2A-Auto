@@ -1933,14 +1933,17 @@ def get_db_connection():
         logger.debug(f"设置SQLite连接参数失败，将使用默认参数: {e}")
     return conn
 
-def add_task(youtube_url, upload_target=None):
-    """
-    添加新任务到数据库
-    
+def add_task(youtube_url, upload_target=None, preset_metadata=None):
+    """添加新任务到数据库。
+
     Args:
         youtube_url: YouTube视频URL
         upload_target: 投稿平台(acfun|bilibili|both)，为空则使用配置默认值
-        
+        preset_metadata: 可选的预填元数据（来自监控侧已抓到的信息），
+            形如 {'video_title_original': ..., 'description_original': ...}。
+            监控在入队前已经拿到标题/简介/频道，直接写入可让任务列表
+            立即显示出标题，不必等任务跑到 fetch_info 才可见。
+
     Returns:
         task_id: 新创建的任务ID
     """
@@ -1956,9 +1959,22 @@ def add_task(youtube_url, upload_target=None):
                 normalized_target = normalize_upload_target(cfg.get('UPLOAD_TARGET_DEFAULT', UPLOAD_TARGET_ACFUN))
             except Exception:
                 normalized_target = UPLOAD_TARGET_ACFUN
+
+        columns = ['id', 'youtube_url', 'upload_target', 'status']
+        values = [task_id, youtube_url, normalized_target, TASK_STATES['PENDING']]
+        # 允许预填元数据：只接受真实存在的列，避免拼错列名导致插入失败
+        if preset_metadata:
+            allowed_cols = {row[1] for row in conn.execute('PRAGMA table_info(tasks)')}
+            for col in ('video_title_original', 'description_original'):
+                val = preset_metadata.get(col)
+                if val and col in allowed_cols:
+                    columns.append(col)
+                    values.append(str(val))
+
+        placeholders = ','.join(['?'] * len(columns))
         conn.execute(
-            'INSERT INTO tasks (id, youtube_url, upload_target, status) VALUES (?, ?, ?, ?)',
-            (task_id, youtube_url, normalized_target, TASK_STATES['PENDING'])
+            f'INSERT INTO tasks ({",".join(columns)}) VALUES ({placeholders})',
+            values,
         )
         conn.commit()
         logger.info(f"新任务添加成功, ID: {task_id}, URL: {youtube_url}, 平台: {normalized_target}")
@@ -2928,37 +2944,30 @@ def _upload_pace_wait_seconds(config):
 
 
 def wait_for_upload_slot(config, logger_obj=None, cancel_event=None):
-    """阻塞直到满足上传节奏约束。返回 True 表示可以上传。
+    """非阻塞检查上传节奏。
 
-    等待期间分段睡眠并响应取消请求，避免长等待阻塞取消操作。
+    返回 (allowed, wait_seconds)：
+      - allowed=True  → 可以立即上传
+      - allowed=False → 需等待 wait_seconds 秒
+
+    原实现用 time.sleep 阻塞等待，会把工作线程长期占住；实测多个任务同时
+    排队时节流 sleep 吃满了 APScheduler 的线程池（4 个），导致每 30 秒的
+    pending 扫描和每日 00:30 的重投任务被系统判定 missed 而直接丢弃。
+    改为立即返回剩余时间，由调用方把任务放回队列并设置 retry_after。
     """
-    total_waited = 0
-    while True:
-        wait_s = _upload_pace_wait_seconds(config)
-        if wait_s <= 0:
-            if total_waited > 0 and logger_obj:
-                logger_obj.info("上传节奏约束已满足，累计等待 %.0f 秒后继续", total_waited)
-            return True
+    if cancel_event is not None and cancel_event.is_set():
+        return False, 0
 
-        if wait_s > 3600:
-            # 单次等待超过 1 小时说明配额窗口未释放，交给调用方决定是否放弃
-            wait_s = 3600
+    wait_s = _upload_pace_wait_seconds(config)
+    if wait_s <= 0:
+        return True, 0
 
-        if logger_obj:
-            logger_obj.info(
-                "上传节流：需等待 %.0f 秒（最小间隔/小时配额/限流惩罚）", wait_s
-            )
-
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
-            if cancel_event is not None and cancel_event.is_set():
-                if logger_obj:
-                    logger_obj.info("等待上传节流期间收到取消请求，中止等待")
-                return False
-            chunk = min(5.0, deadline - time.time())
-            if chunk > 0:
-                time.sleep(chunk)
-            total_waited += chunk
+    if logger_obj:
+        logger_obj.info(
+            "上传节流：需等待 %.0f 秒（最小间隔/小时配额/限流惩罚），任务将延后重试",
+            wait_s,
+        )
+    return False, wait_s
 
 
 def init_upload_semaphore(max_concurrent_uploads=1):
@@ -3119,7 +3128,10 @@ class TaskProcessor:
         
         self.scheduler = BackgroundScheduler(
             executors={
-                'default': APSchedulerThreadPoolExecutor(max_workers=max(2, self._current_max_concurrent_tasks))
+                'default': APSchedulerThreadPoolExecutor(max_workers=max(2, self._current_max_concurrent_tasks)),
+                # 维护类定时任务（每日重投、pending 扫描）用独立执行器：
+                # 工作线程跑满时它们仍能按时执行，不会被判 missed 丢弃。
+                'maintenance': APSchedulerThreadPoolExecutor(max_workers=2),
             },
             job_defaults={
                 'coalesce': False,
@@ -3151,6 +3163,7 @@ class TaskProcessor:
                 'interval',
                 seconds=scan_interval,
                 id='pending_scanner',
+                executor='maintenance',
                 replace_existing=True
             )
             logger.info(f"已启动定时扫描pending任务：每 {scan_interval} 秒")
@@ -3168,6 +3181,7 @@ class TaskProcessor:
                 'interval',
                 seconds=stuck_check_interval,
                 id='stuck_task_recovery',
+                executor='maintenance',
                 replace_existing=True
             )
             logger.info(f"已启动卡住任务扫描：每 {stuck_check_interval} 秒")
@@ -3199,6 +3213,7 @@ class TaskProcessor:
                 self._run_daily_upload_retry,
                 CronTrigger(hour=hour, minute=minute),
                 id='daily_upload_retry',
+                executor='maintenance',
                 replace_existing=True,
                 misfire_grace_time=3600,
             )
@@ -9972,8 +9987,14 @@ class TaskProcessor:
                 task_logger.info("获得上传锁，开始上传到 Bilibili")
                 # 主动节流：最小间隔 + 每小时配额 + 限流惩罚窗口。
                 # 上传锁只保证串行，不能阻止「一条接一条」连发触发平台风控。
-                if not wait_for_upload_slot(self.config, task_logger):
-                    task_logger.info("上传节流等待被取消，放弃本次上传")
+                # 非阻塞：不满足节奏就把任务放回队列并设置 retry_after，
+                # 立即释放线程，避免 sleep 吃满 APScheduler 线程池。
+                allowed, wait_s = wait_for_upload_slot(self.config, task_logger)
+                if not allowed:
+                    if wait_s > 0:
+                        self._defer_task_for_pace(task_id, wait_s, task_logger)
+                    else:
+                        task_logger.info("上传节流检查被取消，放弃本次上传")
                     return
                 self._do_upload_to_bilibili(task_id, task_logger, subtitle_prepared=subtitle_prepared)
                 task_logger.info("释放上传锁")
@@ -10336,6 +10357,24 @@ class TaskProcessor:
                 time.sleep(wait_s)
 
         return False, last_result
+
+    def _defer_task_for_pace(self, task_id, wait_s, task_logger):
+        """因上传节流把任务放回队列，设置到期时间后由扫描器自动重试。
+
+        不占用线程、不阻塞调度器；到期后 pending 扫描器会重新拾取。
+        """
+        retry_after = _compute_retry_after(max(1, int(wait_s / 60) + 1))
+        update_task(
+            task_id,
+            status=TASK_STATES['PENDING'],
+            error_message=f'上传节流，已排队等待（{max(1, int(wait_s / 60))} 分钟后）',
+            retry_after=retry_after,
+            upload_progress=None,
+            silent=True,
+        )
+        task_logger.info(
+            "上传节流：任务已放回队列，将于 %s 自动重试（不占用线程）", retry_after
+        )
 
     def _do_upload_to_bilibili(self, task_id, task_logger, subtitle_prepared=False):
         """实际执行上传到 Bilibili 的逻辑"""

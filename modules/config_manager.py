@@ -231,6 +231,10 @@ DEFAULT_CONFIG = {
     "DAILY_UPLOAD_RETRY_ENABLED": True,
     "DAILY_UPLOAD_RETRY_HOUR": 0,  # 触发小时（0-23）
     "DAILY_UPLOAD_RETRY_MINUTE": 30,  # 触发分钟（0-59）
+    # 监控每日入队总上限（跨所有监控配置共享，按自然日统计）。
+    # 多个配置同时到点（尤其服务重启后集中触发）时，各自的 rate_limit_requests
+    # 会叠加，一次涌入上百条任务，远超实际投稿能力。0 表示不限。
+    "MONITOR_DAILY_ENQUEUE_CAP": 25,
     # 投稿前敏感词替换：B站会自行屏蔽/篡改标题里的敏感词（如「乳头」→「○头」），
     # 与其让平台事后改写、影响曝光，不如投稿前主动替换成等价说法。
     # 格式：JSON 对象 {"原文": "替代词"}，按 key 长度降序匹配（长词优先）。

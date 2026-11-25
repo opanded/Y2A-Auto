@@ -126,6 +126,14 @@ MONITOR_CONFIG_DB_FIELDS: Tuple[str, ...] = tuple(MONITOR_CONFIG_FIELD_DEFAULTS.
 _TITLE_KEYWORD_QUOTED_RE = re.compile(r'"([^"]*)"|“([^”]*)”')
 
 
+def _as_int_monitor(value, default=0):
+    """本模块内的稳健整数转换（模块级无统一工具函数时使用）。"""
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return int(default)
+
+
 class YouTubeMonitor:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
@@ -965,7 +973,23 @@ class YouTubeMonitor:
             logger.info(f"开始处理视频，自动添加到任务队列: {'是' if auto_add_enabled else '否'}")
             if auto_add_enabled:
                 logger.info(f"本次最大添加到任务队列数量: {max_add_to_tasks}")
-            
+
+            # 全局日入队上限：多个配置同时到点（例如服务重启后集中触发）时，
+            # 每个配置各自 rate_limit_requests 会叠加放大，一次涌入上百条任务，
+            # 远超实际投稿能力并让队列长期积压。这里按自然日做总量闸门。
+            daily_cap = self._remaining_daily_enqueue_budget()
+            if auto_add_enabled:
+                if daily_cap <= 0:
+                    logger.warning(
+                        "今日入队已达上限（%s 条），本轮仅记录历史不加入任务队列",
+                        self._daily_enqueue_cap(),
+                    )
+                    auto_add_enabled = False
+                    max_add_to_tasks = 0
+                elif daily_cap < max_add_to_tasks:
+                    logger.info("今日剩余入队额度 %d 条，本轮上限收紧到该值", daily_cap)
+                    max_add_to_tasks = daily_cap
+
             for video in filtered_videos:
                 # 先去重：已处理过的直接跳过，不参与本轮统计
                 if self._is_video_processed(video['id'], config_id):
@@ -1676,6 +1700,7 @@ class YouTubeMonitor:
             video_info = {
                 'id': video['id'],
                 'title': video['snippet']['title'],
+                'description': video['snippet'].get('description', '') or '',
                 'channel_title': video['snippet']['channelTitle'],
                 'channel_id': video['snippet']['channelId'],
                 'published_at': video['snippet']['publishedAt'],
@@ -1934,10 +1959,22 @@ class YouTubeMonitor:
                     )
     
     def _add_video_to_tasks(self, video_info, auto_start=True):
-        """将视频添加到任务队列"""
+        """将视频添加到任务队列。
+
+        监控侧此刻已持有标题与简介，直接预填进任务，避免新建任务在列表里
+        长时间显示「未获取标题」——用户看不到自己在排什么队。
+        """
         try:
             video_url = f"https://www.youtube.com/watch?v={video_info['id']}"
-            task_id = add_task(video_url)
+            preset = {}
+            # video_info 里的字段来自 playlistItems + videos.list，已足够预填
+            title = video_info.get('title')
+            if title:
+                preset['video_title_original'] = title
+            desc = video_info.get('description')
+            if desc:
+                preset['description_original'] = desc
+            task_id = add_task(video_url, preset_metadata=preset)
             
             if task_id:
                 logger.info(f"视频已添加到任务队列: {video_info['title']}, 任务ID: {task_id}")
@@ -2365,28 +2402,75 @@ class YouTubeMonitor:
             conn.commit()
         return True
 
+    def _daily_enqueue_cap(self) -> int:
+        """每日监控入队总上限（条）。0 表示不限。"""
+        try:
+            from modules.config_manager import load_config
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        try:
+            return max(0, int(cfg.get('MONITOR_DAILY_ENQUEUE_CAP', 25) or 0))
+        except (TypeError, ValueError):
+            return 25
+
+    def _remaining_daily_enqueue_budget(self) -> int:
+        """今日剩余的入队额度。上限为 0 时返回一个足够大的数表示不限。"""
+        cap = self._daily_enqueue_cap()
+        if cap <= 0:
+            return 10 ** 6
+        try:
+            today = datetime.now().strftime('%Y-%m-%d')
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM monitor_history "
+                    "WHERE added_to_tasks = 1 AND substr(run_time, 1, 10) = ?",
+                    (today,),
+                ).fetchone()
+            used = row[0] if row else 0
+        except Exception as exc:
+            logger.warning("统计今日入队数量失败，按不限制处理: %s", exc)
+            return cap
+        return max(0, cap - used)
+
     def _schedule_monitor(self, config_id, interval_minutes):
-        """添加监控任务到调度器"""
+        """添加监控任务到调度器。
+
+        同一间隔的多个配置会同时到点，集中发起大量频道请求；实测 11 个配置
+        齐发时大量 TLS 握手被打断（SSL: WRONG_VERSION_NUMBER），整轮监控失败。
+        这里按配置 ID 错开首次触发时间，把并发摊平。
+        """
         job_id = f"monitor_{config_id}"
-        
+
         try:
             config = self.get_monitor_config(config_id)
             config_name = config['name'] if config else f"ID-{config_id}"
-            
+
+            # 错峰：每个配置延迟 (序号 × 错峰间隔) 分钟，避免所有配置同一秒起跑
+            stagger_minutes = _as_int_monitor(config.get('schedule_stagger_minutes'), 0)
+            if stagger_minutes <= 0:
+                stagger_minutes = 1  # 默认每个配置错开 1 分钟
+            offset_minutes = (max(0, int(config_id)) % 60) * stagger_minutes
+            start_date = datetime.now() + timedelta(minutes=offset_minutes)
+
             self.scheduler.add_job(
                 func=self.run_monitor,
                 trigger='interval',
                 minutes=interval_minutes,
                 id=job_id,
                 args=[config_id],
-                replace_existing=True
+                replace_existing=True,
+                next_run_time=start_date,
             )
-            
+
             if not self.scheduler.running:
                 self.scheduler.start()
                 logger.info("调度器已启动")
-                
-            logger.info(f"添加监控调度任务: {config_name} ({job_id}), 间隔: {interval_minutes}分钟")
+
+            logger.info(
+                f"添加监控调度任务: {config_name} ({job_id}), 间隔: {interval_minutes}分钟"
+                f", 首次触发: {start_date.strftime('%H:%M')}"
+            )
         except Exception as e:
             logger.error(f"添加调度任务失败: {str(e)}")
     

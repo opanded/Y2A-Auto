@@ -994,15 +994,59 @@ body {
 
 /* 表格列宽设置（总和≤100%，避免出现横向滚动条） */
 .tasks-table th.col-select { width: 3%; }
-.tasks-table th.col-id { width: 7%; }
-.tasks-table th.col-title { width: 19%; }
+.tasks-table th.col-id { width: 9%; }
+.tasks-table th.col-title { width: 18%; }
 .tasks-table th.col-status { width: 10%; }
-.tasks-table th.col-time { width: 10%; }
+.tasks-table th.col-time { width: 9%; }
 .tasks-table th.col-platform { width: 6%; }
-.tasks-table th.col-partition { width: 10%; }
+.tasks-table th.col-partition { width: 9%; }
 .tasks-table th.col-tags { width: 9%; }
 .tasks-table th.col-result { width: 10%; }
-.tasks-table th.col-actions { width: 16%; }
+.tasks-table th.col-actions { width: 17%; }
+
+/* ID 单元格：短 ID 常显，复制按钮悬停浮现，避免窄列里图标被裁掉 */
+.tasks-table .id-cell {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+    min-width: 0;
+}
+
+.tasks-table .id-cell .id-text {
+    flex: 0 0 auto;
+    font-size: .8125rem;
+    color: var(--bs-secondary-color, #6c757d);
+}
+
+/* 复制按钮：默认极淡，悬停行或按钮本身时高亮到可点状态 */
+.copy-id-btn {
+    flex: 0 0 auto;
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: .25rem;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity .15s ease-in-out, background-color .15s ease-in-out;
+}
+
+.tasks-table tr:hover .copy-id-btn,
+.copy-id-btn:focus-visible {
+    opacity: .65;
+}
+
+.copy-id-btn:hover {
+    opacity: 1 !important;
+    background: var(--bs-primary-bg-subtle, #cfe2ff);
+}
+
+.copy-id-btn.copied {
+    opacity: 1;
+    color: var(--bs-success, #198754);
+}
 
 /* 批量操作栏：勾选后浮在列表上方，不挤压布局 */
 .bulk-action-bar {

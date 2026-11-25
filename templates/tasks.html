@@ -1056,7 +1056,21 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         queryAllWithin(root, '.copy-id-btn').forEach(btn => {
             if (btn.dataset.bindCopyId === '1') return;
             btn.dataset.bindCopyId = '1';
-            btn.addEventListener('click', () => copyToClipboard(btn.dataset.fullId));
+            btn.addEventListener('click', () => {
+                copyToClipboard(btn.dataset.fullId);
+                // 复制成功后短暂变绿并换成对勾，给用户明确反馈
+                if (btn.dataset.reverting === '1') return;
+                btn.dataset.reverting = '1';
+                const icon = btn.querySelector('i');
+                const prev = icon ? icon.className : '';
+                btn.classList.add('copied');
+                if (icon) icon.className = 'bi bi-check-lg';
+                setTimeout(() => {
+                    btn.classList.remove('copied');
+                    if (icon) icon.className = prev;
+                    btn.dataset.reverting = '0';
+                }, 1200);
+            });
         });
 
         queryAllWithin(root, '.copy-ac-btn').forEach(btn => {

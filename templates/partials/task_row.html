@@ -76,9 +76,11 @@
                name="task_ids" value="{{ task.id }}" aria-label="选择任务 {{ task.id[:8] }}">
     </td>
     <td>
-        <div class="id-cell d-flex align-items-center gap-1">
-            <span class="text-monospace" title="{{ task.id }}">{{ task.id[:8] }}...</span>
-            <button type="button" class="btn btn-link p-0 ms-1 copy-id-btn" title="复制ID" data-full-id="{{ task.id }}">
+        <div class="id-cell">
+            <span class="id-text text-monospace" title="{{ task.id }}">{{ task.id[:8] }}</span>
+            <button type="button" class="btn btn-link copy-id-btn"
+                    title="复制完整 ID" aria-label="复制任务 ID"
+                    data-full-id="{{ task.id }}">
                 <i class="bi bi-clipboard"></i>
             </button>
         </div>
