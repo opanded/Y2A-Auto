@@ -895,6 +895,133 @@ body {
         flex-direction: column;
         align-items: flex-start;
     }
+
+    /* ---------- 任务页：手机竖屏 ---------- */
+    /* 标题与操作按钮改为两行，避免「新建任务/清除所有任务」被压成半截 */
+    .tasks-container > .d-flex.justify-content-between {
+        flex-direction: column;
+        align-items: stretch !important;
+        gap: .75rem;
+    }
+
+    .tasks-container > .d-flex.justify-content-between > .d-flex {
+        width: 100%;
+    }
+
+    .tasks-container > .d-flex.justify-content-between .btn {
+        flex: 1 1 auto;
+        white-space: nowrap;
+        font-size: .875rem;
+        padding: .4rem .6rem;
+    }
+
+    /* 工具栏：状态下拉 + 每页条数同排，搜索框与筛选按钮同排 */
+    .tasks-toolbar {
+        padding: .6rem;
+    }
+
+    .tasks-toolbar form.d-flex {
+        display: grid !important;
+        grid-template-columns: 1fr auto;
+        gap: .45rem !important;
+    }
+
+    .tasks-toolbar form.d-flex select[name="status"] {
+        grid-column: 1;
+        width: 100% !important;
+    }
+
+    .tasks-toolbar form.d-flex select[name="per_page"] {
+        grid-column: 2;
+        width: auto !important;
+    }
+
+    /* 搜索框占一列，「筛选」按钮紧贴右侧同排 */
+    .tasks-toolbar form.d-flex input[name="q"] {
+        grid-column: 1;
+        width: 100% !important;
+    }
+
+    .tasks-toolbar form.d-flex button[type="submit"] {
+        grid-column: 2;
+        white-space: nowrap;
+        padding: .35rem .7rem;
+    }
+
+    .tasks-toolbar form.d-flex a.btn-link {
+        grid-column: 1 / -1;
+        text-align: center;
+        padding: .2rem 0;
+    }
+
+    /* 统计徽章：等宽两列排布，避免参差不齐 */
+    .tasks-toolbar .badge.rounded-pill {
+        flex: 1 1 calc(50% - .25rem);
+        text-align: center;
+        font-size: .8125rem;
+        padding: .35rem .5rem !important;
+    }
+
+    /* 投稿节奏与「重投历史投稿」单独一行 */
+    .tasks-toolbar .small.text-muted {
+        flex: 1 1 100%;
+    }
+
+    .tasks-toolbar form.ms-auto {
+        flex: 1 1 100%;
+        margin-left: 0 !important;
+    }
+
+    .tasks-toolbar form.ms-auto .btn {
+        width: 100%;
+    }
+
+    /* 批量操作栏：按钮两列排布，可横向滚动避免挤压 */
+    .bulk-action-bar {
+        padding: .5rem;
+    }
+
+    .bulk-action-bar .d-flex {
+        display: grid !important;
+        grid-template-columns: 1fr 1fr;
+        gap: .4rem !important;
+    }
+
+    .bulk-action-bar .text-muted {
+        grid-column: 1 / -1;
+    }
+
+    .bulk-action-bar .btn {
+        width: 100%;
+        font-size: .8125rem;
+        padding: .35rem .4rem;
+    }
+
+    /* 任务卡片：操作区按钮等宽，长文案自动换行 */
+    .task-actions-grid-2 {
+        grid-template-columns: 1fr !important;
+    }
+
+    .task-card .task-actions .btn {
+        font-size: .85rem;
+        padding: .45rem .5rem;
+    }
+}
+
+/* 超窄屏（小屏手机竖屏，如 iPhone SE） */
+@media (max-width: 380px) {
+    .tasks-container {
+        padding-left: .5rem;
+        padding-right: .5rem;
+    }
+
+    .tasks-toolbar .badge.rounded-pill {
+        flex: 1 1 100%;
+    }
+
+    .task-card .title-clamp-3 {
+        -webkit-line-clamp: 2;
+    }
 }
 
 /* 任务卡片 */
