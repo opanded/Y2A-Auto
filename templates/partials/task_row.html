@@ -72,6 +72,10 @@
 {% endif %}
 <tr data-task-id="{{ task.id }}" data-task-status="{{ task.status }}" class="status-{{ task.status }}">
     <td>
+        <input type="checkbox" class="form-check-input task-select-checkbox"
+               name="task_ids" value="{{ task.id }}" aria-label="选择任务 {{ task.id[:8] }}">
+    </td>
+    <td>
         <div class="id-cell d-flex align-items-center gap-1">
             <span class="text-monospace" title="{{ task.id }}">{{ task.id[:8] }}...</span>
             <button type="button" class="btn btn-link p-0 ms-1 copy-id-btn" title="复制ID" data-full-id="{{ task.id }}">
@@ -90,6 +94,13 @@
             <span class="badge rounded-pill bg-{{ task_status_color(task.status) }} task-status-badge" data-task-status-badge>
                 <i class="bi bi-{{ icon }} me-1"></i>{{ task_status_display(task.status) }}
             </span>
+            {# 限流冷却：直接显示「什么时候会重试」，避免只看到 pending 却不知原因 #}
+            {% if task.retry_after %}
+                <span class="badge rounded-pill bg-warning text-dark mt-1"
+                      title="平台限流后已排入延迟队列，到期自动重试">
+                    <i class="bi bi-hourglass-split me-1"></i>{{ task.retry_after[11:16] }} 重试
+                </span>
+            {% endif %}
             <small class="text-muted mt-1{% if not show_progress %} d-none{% endif %}" data-task-progress>{{ task.upload_progress or '' }}</small>
             {% if task.subtitle_qc_failed or task.asr_warning_message %}
                 {% if task.asr_warning_message %}

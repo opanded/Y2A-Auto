@@ -993,15 +993,41 @@ body {
 }
 
 /* 表格列宽设置（总和≤100%，避免出现横向滚动条） */
+.tasks-table th.col-select { width: 3%; }
 .tasks-table th.col-id { width: 7%; }
-.tasks-table th.col-title { width: 20%; }
+.tasks-table th.col-title { width: 19%; }
 .tasks-table th.col-status { width: 10%; }
 .tasks-table th.col-time { width: 10%; }
 .tasks-table th.col-platform { width: 6%; }
-.tasks-table th.col-partition { width: 11%; }
-.tasks-table th.col-tags { width: 10%; }
+.tasks-table th.col-partition { width: 10%; }
+.tasks-table th.col-tags { width: 9%; }
 .tasks-table th.col-result { width: 10%; }
 .tasks-table th.col-actions { width: 16%; }
+
+/* 批量操作栏：勾选后浮在列表上方，不挤压布局 */
+.bulk-action-bar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    margin-bottom: .75rem;
+    padding: .55rem .85rem;
+    border: 1px solid var(--bs-primary-border-subtle, #b6d4fe);
+    border-radius: .5rem;
+    background: var(--bs-primary-bg-subtle, #cfe2ff);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, .08);
+}
+
+/* 任务页工具栏：筛选与统计保持紧凑 */
+.tasks-toolbar {
+    padding: .65rem .75rem;
+    border: 1px solid var(--bs-border-color, #dee2e6);
+    border-radius: .5rem;
+    background: var(--bs-tertiary-bg, #f8f9fa);
+}
+
+.tasks-toolbar .badge {
+    font-weight: 500;
+}
 
 /* 防止首列内容外溢覆盖后续列（例如复制按钮与标题行重叠） */
 .tasks-table td.col-id, .tasks-table th.col-id {

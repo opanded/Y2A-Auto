@@ -2205,32 +2205,140 @@ def get_all_tasks():
     finally:
         conn.close()
 
-def get_tasks_paginated(page=1, per_page=20):
+# 任务列表的虚拟筛选组：把用户真正关心的几类任务归到一起，
+# 避免在十几个细碎状态里逐个勾选。
+TASK_FILTER_GROUPS = {
+    # 「待上传」既包含素材齐备待投的，也包含限流冷却中等候重投的（pending）
+    'upload_pending': [
+        'ready_for_upload', 'awaiting_manual_review', 'pending',
+    ],
+    'in_progress': [
+        'downloading', 'downloaded', 'encoding_video',
+        'asr_transcribing', 'translating_subtitle', 'translating',
+        'tagging', 'partitioning', 'moderating', 'uploading',
+        'fetching_info', 'info_fetched',
+    ],
+    'done': ['completed'],
+    'problem': ['failed'],
+}
+
+# 供模板渲染筛选下拉
+TASK_FILTER_OPTIONS = [
+    ('', '全部任务'),
+    ('upload_pending', '待上传'),
+    ('problem', '失败/需处理'),
+    ('in_progress', '处理中'),
+    ('done', '已完成'),
+]
+
+
+def _build_task_filter_sql(status_filter=None, keyword=None):
+    """根据筛选条件构造 WHERE 子句与参数列表。"""
+    clauses = []
+    params = []
+
+    sf = str(status_filter or '').strip()
+    if sf:
+        group = TASK_FILTER_GROUPS.get(sf)
+        if group:
+            clauses.append('status IN (%s)' % ','.join(['?'] * len(group)))
+            params.extend(group)
+        else:
+            clauses.append('status = ?')
+            params.append(sf)
+
+    kw = str(keyword or '').strip()
+    if kw:
+        clauses.append('(COALESCE(video_title_original, \'\') LIKE ? '
+                       'OR COALESCE(video_title_translated, \'\') LIKE ?)')
+        like = f'%{kw}%'
+        params.extend([like, like])
+
+    if not clauses:
+        return '', []
+    return 'WHERE ' + ' AND '.join(clauses), params
+
+
+def get_task_status_counts():
+    """返回各状态任务数，供任务页顶部统计条使用。"""
+    counts = {}
+    try:
+        conn = get_db_connection()
+        for row in conn.execute('SELECT status, COUNT(*) AS n FROM tasks GROUP BY status'):
+            counts[row['status']] = row['n']
+    except Exception as exc:
+        logger.warning("统计任务状态失败: %s", exc)
+        return {}
+    return counts
+
+
+def get_upload_pace_status(config=None):
+    """返回当前上传节奏状态，供任务页展示「何时能投下一条」。
+
+    只读取节流器内存状态，不触发任何上传动作。
     """
-    获取分页任务信息
-    
+    cfg = config or {}
+    if not _as_bool(cfg.get('UPLOAD_PACE_ENABLED', True)):
+        return {'enabled': False}
+
+    now = time.time()
+    with _upload_pace_lock:
+        history = list(_upload_history)
+        penalized_until = _upload_penalty_until
+        factor = max(1, _upload_penalty_factor)
+
+    hourly_limit = _as_int(cfg.get('UPLOAD_MAX_PER_HOUR', 10), 10, minimum=0)
+    recent = [t for t in history if t > now - 3600]
+
+    wait_s = _upload_pace_wait_seconds(cfg)
+    next_at = datetime.fromtimestamp(now + wait_s) if wait_s > 0 else None
+
+    return {
+        'enabled': True,
+        'min_interval': _as_int(cfg.get('UPLOAD_MIN_INTERVAL_SECONDS', 180), 180, minimum=0),
+        'hourly_limit': hourly_limit,
+        'used_last_hour': len(recent),
+        'remaining_this_hour': max(0, hourly_limit - len(recent)) if hourly_limit else None,
+        'penalty_active': penalized_until > now,
+        'penalty_until': (
+            datetime.fromtimestamp(penalized_until).strftime('%H:%M')
+            if penalized_until > now else None
+        ),
+        'slowdown_factor': factor,
+        'next_upload_at': next_at.strftime('%H:%M:%S') if next_at else None,
+        'can_upload_now': wait_s <= 0,
+    }
+
+
+def get_tasks_paginated(page=1, per_page=20, status_filter=None, keyword=None):
+    """获取分页任务信息。
+
     Args:
         page (int): 页码，从1开始
-        per_page (int): 每页数量，默认20
-    
+        per_page (int): 每页数量
+        status_filter (str|None): 状态筛选。支持单状态（'failed'）或
+            虚拟筛选组：'upload_pending'（待上传类）、'in_progress'（处理中类）。
+        keyword (str|None): 标题关键词（同时匹配原文与译文）。
+
     Returns:
-        dict: 包含tasks、total、page、per_page、total_pages等信息的字典
+        dict: 包含 tasks / total / page / per_page / total_pages 等。
     """
     conn = get_db_connection()
     try:
-        # 获取总数
-        cursor = conn.execute('SELECT COUNT(*) FROM tasks')
+        where_sql, params = _build_task_filter_sql(status_filter, keyword)
+
+        cursor = conn.execute(f'SELECT COUNT(*) FROM tasks {where_sql}', params)
         total = cursor.fetchone()[0]
-        
-        # 计算分页参数
-        total_pages = (total + per_page - 1) // per_page  # 向上取整
+
+        total_pages = (total + per_page - 1) // per_page if total else 0
         offset = (page - 1) * per_page
-        
-        # 获取分页数据
-        cursor = conn.execute('SELECT * FROM tasks ORDER BY created_at DESC LIMIT ? OFFSET ?', 
-                            (per_page, offset))
+
+        cursor = conn.execute(
+            f'SELECT * FROM tasks {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?',
+            list(params) + [per_page, offset],
+        )
         tasks = [dict(row) for row in cursor.fetchall()]
-        
+
         return {
             'tasks': tasks,
             'total': total,
@@ -2240,7 +2348,9 @@ def get_tasks_paginated(page=1, per_page=20):
             'has_prev': page > 1,
             'has_next': page < total_pages,
             'prev_page': page - 1 if page > 1 else None,
-            'next_page': page + 1 if page < total_pages else None
+            'next_page': page + 1 if page < total_pages else None,
+            'status_filter': status_filter or '',
+            'keyword': keyword or '',
         }
     except Exception as e:
         logger.error(f"获取分页任务失败: {str(e)}")
@@ -2409,6 +2519,81 @@ def _start_background_upload_retry(task_id, config):
             logger.error(f"后台上传重试任务 {task_id} 出错: {exc}")
 
     threading.Thread(target=run_upload_retry, daemon=True).start()
+
+def requeue_yesterday_upload_failures(config=None):
+    """把「前一天及更早」遗留的投稿任务重新排入待处理队列。
+
+    覆盖三类需要重投的任务：
+      1. ready_for_upload —— 素材齐备但没投出去（如临时关自动、手动未触发）
+      2. failed 且属于上传阶段 —— 上次投稿被拒
+      3. pending 且 retry_after 已过期 —— 限流延迟队列里到期却漏跑的
+
+    跳过下载失败等非上传原因（重试也不会成功），也跳过今天新建的任务，
+    避免影响当天正常推进的队列。
+
+    返回重新排队的任务数。
+    """
+    cfg = config or {}
+    if not _as_bool(cfg.get('DAILY_UPLOAD_RETRY_ENABLED', True)):
+        return 0
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    requeued = 0
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, status, error_message, error_category, upload_target,
+                   retry_after, created_at, video_path_local, cover_path_local
+            FROM tasks
+            WHERE (
+                    status = 'ready_for_upload'
+                 OR (status = 'failed' AND (error_message IS NULL OR error_message NOT LIKE '%下载%'))
+                 OR (status = 'pending' AND retry_after IS NOT NULL AND retry_after <= ?)
+            )
+            AND substr(COALESCE(created_at, ''), 1, 10) < ?
+            """,
+            (now_str, today_str),
+        ).fetchall()
+
+        if not rows:
+            logger.info("每日凌晨重试：没有需要重投的历史投稿任务")
+            return 0
+
+        for row in rows:
+            task_id = row['id']
+            error_text = str(row['error_message'] or '')
+            # 永久性下载失败不重投（地区限制、视频已删除等）
+            if _is_permanent_download_failure(error_text):
+                logger.info("每日凌晨重试：跳过永久失败任务 %s（%s）",
+                            task_id[:8], error_text[:50])
+                continue
+
+            # 已有上传响应的直接纠正为完成，避免重复投稿
+            if _task_has_upload_response(dict(row), row['upload_target']):
+                update_task(
+                    task_id, silent=True,
+                    status=TASK_STATES['COMPLETED'],
+                    error_message=None, upload_progress=None, retry_after=None,
+                )
+                continue
+
+            update_task(
+                task_id, silent=True,
+                status=TASK_STATES['PENDING'],
+                error_message=None,
+                error_category=None,
+                retry_after=None,
+                upload_progress=None,
+            )
+            requeued += 1
+
+        conn.commit()
+
+    return requeued
+
 
 def retry_failed_tasks(config=None):
     """重新调度所有失败的任务。"""
@@ -2617,6 +2802,123 @@ def delete_task_files(task_id):
 upload_queue_lock = threading.Lock()
 upload_semaphore = None
 task_semaphore = None
+
+# ---------------------------------------------------------------- 上传节流
+# 上传信号量只限「同时几个」，不限「多快发下一个」。实测短时间连发（最小间隔 1 秒、
+# 中位 38 秒）会在约 24 条后触发 B站 137022「投稿过于频繁」，之后整个账号被压住。
+# 这里额外加一层主动节奏控制：最小间隔 + 每小时配额，并且一旦真的撞限流就自动降速。
+_upload_pace_lock = threading.Lock()
+_upload_history = []          # 最近成功上传的时间戳（单调递增）
+_upload_penalty_until = 0.0   # 限流后强制静默到这个时间点
+_upload_penalty_factor = 1    # 连续限流时的额外等待倍数
+
+
+def _reset_upload_pace_state():
+    """清空节流状态（配置变更或测试时使用）。"""
+    global _upload_penalty_until, _upload_penalty_factor
+    with _upload_pace_lock:
+        _upload_history.clear()
+        _upload_penalty_until = 0.0
+        _upload_penalty_factor = 1
+
+
+def note_upload_success():
+    """记录一次成功上传，供节流器计算间隔与小时配额。"""
+    global _upload_penalty_factor
+    now = time.time()
+    with _upload_pace_lock:
+        _upload_history.append(now)
+        # 只保留最近 2 小时，避免列表无限增长
+        cutoff = now - 7200
+        while _upload_history and _upload_history[0] < cutoff:
+            _upload_history.pop(0)
+        # 成功即说明限流已解除，逐步恢复原节奏
+        _upload_penalty_factor = 1
+
+
+def note_upload_rate_limited(config=None):
+    """上传撞上平台限流：记录惩罚窗口，并让后续等待时间继续加倍。"""
+    global _upload_penalty_until, _upload_penalty_factor
+    cfg = config or {}
+    cooldown_min = _as_int(cfg.get('UPLOAD_RATE_LIMIT_RETRY_MINUTES', 120), 120, minimum=1)
+    with _upload_pace_lock:
+        _upload_penalty_factor = min(8, max(1, _upload_penalty_factor) * 2)
+        # 与延迟重试保持一致：限流后一段时间内不再发起任何上传
+        _upload_penalty_until = max(
+            _upload_penalty_until, time.time() + cooldown_min * 60
+        )
+
+
+def _upload_pace_wait_seconds(config):
+    """返回为了满足节奏约束，本次上传还需要等待多少秒（0 表示可立即上传）。"""
+    if not _as_bool(config.get('UPLOAD_PACE_ENABLED', True)):
+        return 0.0
+
+    min_interval = _as_int(config.get('UPLOAD_MIN_INTERVAL_SECONDS', 180), 180, minimum=0)
+    hourly_limit = _as_int(config.get('UPLOAD_MAX_PER_HOUR', 10), 10, minimum=0)
+
+    now = time.time()
+    with _upload_pace_lock:
+        history = list(_upload_history)
+        penalized_until = _upload_penalty_until
+        factor = max(1, _upload_penalty_factor)
+
+    wait = 0.0
+
+    # 1) 限流惩罚窗口
+    if penalized_until > now:
+        wait = max(wait, penalized_until - now)
+
+    # 2) 最小间隔（连续限流后按倍数放大）
+    if min_interval and history:
+        last_at = history[-1]
+        wait = max(wait, last_at + min_interval * factor - now)
+
+    # 3) 每小时配额：最近 1 小时内已达上限时，等到最早那条滑出窗口
+    if hourly_limit:
+        window_start = now - 3600
+        recent = [t for t in history if t > window_start]
+        if len(recent) >= hourly_limit:
+            # recent 已按时间升序，最早的一条滑出窗口即释放一个名额
+            release_at = recent[len(recent) - hourly_limit] + 3600
+            wait = max(wait, release_at - now)
+
+    return max(0.0, wait)
+
+
+def wait_for_upload_slot(config, logger_obj=None, cancel_event=None):
+    """阻塞直到满足上传节奏约束。返回 True 表示可以上传。
+
+    等待期间分段睡眠并响应取消请求，避免长等待阻塞取消操作。
+    """
+    total_waited = 0
+    while True:
+        wait_s = _upload_pace_wait_seconds(config)
+        if wait_s <= 0:
+            if total_waited > 0 and logger_obj:
+                logger_obj.info("上传节奏约束已满足，累计等待 %.0f 秒后继续", total_waited)
+            return True
+
+        if wait_s > 3600:
+            # 单次等待超过 1 小时说明配额窗口未释放，交给调用方决定是否放弃
+            wait_s = 3600
+
+        if logger_obj:
+            logger_obj.info(
+                "上传节流：需等待 %.0f 秒（最小间隔/小时配额/限流惩罚）", wait_s
+            )
+
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                if logger_obj:
+                    logger_obj.info("等待上传节流期间收到取消请求，中止等待")
+                return False
+            chunk = min(5.0, deadline - time.time())
+            if chunk > 0:
+                time.sleep(chunk)
+            total_waited += chunk
+
 
 def init_upload_semaphore(max_concurrent_uploads=1):
     """初始化上传信号量"""
@@ -2830,6 +3132,48 @@ class TaskProcessor:
             logger.info(f"已启动卡住任务扫描：每 {stuck_check_interval} 秒")
         except Exception as e:
             logger.warning(f"注册卡住任务扫描失败（不影响主流程）：{e}")
+
+        # 每日凌晨自动重投前一天失败的投稿。
+        # B站 的日投稿配额按自然日重置，凌晨是唯一稳定能恢复的窗口；
+        # 放在这里而不是依赖人工点击「重试失败任务」，避免漏掉整批待投稿件。
+        try:
+            self._schedule_daily_upload_retry()
+        except Exception as e:
+            logger.warning(f"注册每日凌晨失败投稿重试失败（不影响主流程）：{e}")
+
+    def _schedule_daily_upload_retry(self):
+        """注册「每天凌晨重投前一天失败投稿」定时任务。"""
+        if not _as_bool(self.config.get('DAILY_UPLOAD_RETRY_ENABLED', True)):
+            logger.info("每日凌晨失败投稿重试已关闭（DAILY_UPLOAD_RETRY_ENABLED=False）")
+            return
+
+        hour = _as_int(self.config.get('DAILY_UPLOAD_RETRY_HOUR', 0), 0, minimum=0)
+        minute = _as_int(self.config.get('DAILY_UPLOAD_RETRY_MINUTE', 30), 30, minimum=0)
+        hour = min(23, max(0, hour))
+        minute = min(59, max(0, minute))
+
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            self.scheduler.add_job(
+                self._run_daily_upload_retry,
+                CronTrigger(hour=hour, minute=minute),
+                id='daily_upload_retry',
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+            logger.info(
+                "已启动每日凌晨失败投稿重试：每天 %02d:%02d", hour, minute
+            )
+        except Exception as e:
+            logger.warning("注册每日凌晨重试失败: %s", e)
+
+    def _run_daily_upload_retry(self):
+        """把前一天遗留的失败/待投稿件重新排入队列。"""
+        try:
+            requeued = requeue_yesterday_upload_failures(self.config)
+            logger.info("每日凌晨重试：已重新排队 %d 个投稿任务", requeued)
+        except Exception as e:
+            logger.error("每日凌晨重试执行失败: %s", e)
 
     def _refresh_runtime_limits(self, force=False):
         """按当前配置刷新并发上限；运行中有活动任务时延后生效。"""
@@ -3241,6 +3585,14 @@ class TaskProcessor:
                 upload_target = _get_task_upload_target(task)
                 if task['status'] == TASK_STATES['AWAITING_REVIEW']:
                     task_logger.info("任务当前处于人工审核状态，保留待审核状态")
+                elif str(task.get('retry_after') or '').strip() and task['status'] == TASK_STATES['PENDING']:
+                    # 平台限流后已被排入延迟重试队列：必须保留 pending + retry_after，
+                    # 否则会被下面的分支覆盖成 ready_for_upload，而该状态不会被扫描器
+                    # 自动拾取，任务就此永久卡住（实测 13 条全部卡死在此）。
+                    task_logger.info(
+                        "任务处于限流冷却中（%s 后可重试），保留延迟队列状态",
+                        task.get('retry_after'),
+                    )
                 elif task['status'] != TASK_STATES['COMPLETED'] and task['status'] != TASK_STATES['FAILED']:
                     # 如果没有开启自动上传或者上传失败，则标记为"准备上传"
                     if not self.config.get('AUTO_MODE_ENABLED', False) or not _task_has_upload_response(task, upload_target):
@@ -9577,6 +9929,11 @@ class TaskProcessor:
             assert upload_semaphore is not None, "upload_semaphore 应该已经初始化"
             with upload_semaphore:
                 task_logger.info("获得上传锁，开始上传到 Bilibili")
+                # 主动节流：最小间隔 + 每小时配额 + 限流惩罚窗口。
+                # 上传锁只保证串行，不能阻止「一条接一条」连发触发平台风控。
+                if not wait_for_upload_slot(self.config, task_logger):
+                    task_logger.info("上传节流等待被取消，放弃本次上传")
+                    return
                 self._do_upload_to_bilibili(task_id, task_logger, subtitle_prepared=subtitle_prepared)
                 task_logger.info("释放上传锁")
         except Exception as e:
@@ -9915,6 +10272,12 @@ class TaskProcessor:
                 return success, result
 
             last_result = result
+            # 平台级限流（137022 投稿过于频繁）不走本地的分钟级重试——
+            # 它需要小时级冷却，交给上层排入延迟队列。在这里反复重试只会
+            # 白白占用上传锁 50 分钟，还让账号持续处于被拒状态。
+            if _is_platform_rate_limit_error(result):
+                return False, result
+
             if attempt >= max_attempts or not _is_retryable_upload_error(result):
                 return success, result
 
@@ -10182,6 +10545,8 @@ class TaskProcessor:
 
             if success:
                 task_logger.info(f"bilibili上传成功: {result}")
+                # 记录一次成功上传，供节流器计算间隔与小时配额
+                note_upload_success()
                 update_task(
                     task_id,
                     status=TASK_STATES['COMPLETED'],
@@ -10209,6 +10574,9 @@ class TaskProcessor:
                 task_logger.error(f"bilibili上传失败: {result}")
                 # 平台级限流（137022 投稿过于频繁）无法靠秒级重试恢复：
                 # 排入延迟队列，到点后由 pending 扫描器自动重新上传。
+                # 同时通知节流器降速，避免后续任务继续撞墙。
+                if _is_platform_rate_limit_error(result):
+                    note_upload_rate_limited(self.config)
                 if _schedule_rate_limit_retry(task_id, task_logger, result, self.config):
                     return
                 update_task(

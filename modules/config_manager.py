@@ -154,6 +154,9 @@ DEFAULT_CONFIG = {
     "YOUTUBE_PROXY_USERNAME": "",  # 代理用户名（可选）
     "YOUTUBE_PROXY_PASSWORD": "",  # 代理密码（可选）
     "YOUTUBE_DOWNLOAD_THREADS": 4,  # yt-dlp下载线程数（并发片段数）
+    # yt-dlp 静默超时（秒）：进程连续这么久没有任何输出即判定为卡死并终止。
+    # 覆盖「读 stdout 阻塞导致任务永久停在 downloading」的场景，下限 60 秒。
+    "YTDLP_SILENT_TIMEOUT_SECONDS": 300,
     "YOUTUBE_DOWNLOAD_QUALITY_MODE": _YOUTUBE_DOWNLOAD_QUALITY_MODE_DEFAULT,  # highest|manual
     "YOUTUBE_DOWNLOAD_MAX_HEIGHT": _YOUTUBE_DOWNLOAD_MAX_HEIGHT_DEFAULT,  # 手动画质上限
     "YOUTUBE_THROTTLED_RATE": "",  # 限制下载速度，格式如：1M、500K等，留空不限制
@@ -213,6 +216,16 @@ DEFAULT_CONFIG = {
     "UPLOAD_RATE_LIMIT_RETRY_ENABLED": True,
     "UPLOAD_RATE_LIMIT_RETRY_MINUTES": 120,  # 冷却时长（分钟）
     "UPLOAD_RATE_LIMIT_MAX_RETRIES": 5,  # 最多退避重试轮数，0 表示不限
+    # 上传主动节流：上传信号量只限并发数，限不住「一条接一条」的发送速度。
+    # 实测短间隔连发（最小 1 秒、中位 38 秒）约 24 条后即触发平台限流。
+    "UPLOAD_PACE_ENABLED": True,
+    "UPLOAD_MIN_INTERVAL_SECONDS": 180,  # 两次上传之间的最小间隔（秒）
+    "UPLOAD_MAX_PER_HOUR": 10,  # 每小时最多上传条数，0 表示不限
+    # 每日凌晨自动重投前一天遗留的投稿任务。平台日投稿配额按自然日重置，
+    # 凌晨是唯一稳定恢复的窗口，不必依赖人工点「重试失败任务」。
+    "DAILY_UPLOAD_RETRY_ENABLED": True,
+    "DAILY_UPLOAD_RETRY_HOUR": 0,  # 触发小时（0-23）
+    "DAILY_UPLOAD_RETRY_MINUTE": 30,  # 触发分钟（0-59）
     # 投稿前敏感词替换：B站会自行屏蔽/篡改标题里的敏感词（如「乳头」→「○头」），
     # 与其让平台事后改写、影响曝光，不如投稿前主动替换成等价说法。
     # 格式：JSON 对象 {"原文": "替代词"}，按 key 长度降序匹配（长词优先）。

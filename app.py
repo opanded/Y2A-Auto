@@ -26,6 +26,12 @@ from modules.config_manager import load_config, update_config, reset_specific_co
 from modules.whisper_languages import WHISPER_LANGUAGE_LIST
 from modules.subtitle_style import normalize_hex_color
 from modules.task_manager import add_task, start_task, get_task, get_tasks_paginated, get_tasks_by_status, update_task, delete_task, force_upload_task, TASK_STATES, clear_all_tasks, retry_failed_tasks, is_metadata_translation_retryable, get_metadata_translation_retry_block_reason, retry_metadata_translation_task, register_task_updates_listener, unregister_task_updates_listener, resolve_cookie_file_path
+from modules.task_manager import (  # noqa: E402
+    TASK_FILTER_OPTIONS,
+    get_task_status_counts,
+    get_upload_pace_status,
+    requeue_yesterday_upload_failures,
+)
 from modules.acfun_auth import AcfunQrLoginSession
 from modules.bilibili_auth import BilibiliQrLoginSession
 from modules.bilibili_uploader import bilibili_submit_api_badge
@@ -1656,6 +1662,8 @@ def init_id_mapping():
 def task_status_display(status):
     """将任务状态代码转换为显示文本"""
     status_map = {
+        # pending 既可能是刚入队待处理，也可能是限流冷却中待重投；
+        # 行内另有「HH:MM 重试」徽章区分，这里用中性措辞避免误解。
         TASK_STATES['PENDING']: '等待处理',
         TASK_STATES['DOWNLOADING']: '下载中',
         TASK_STATES['DOWNLOADED']: '下载完成',
@@ -2082,19 +2090,31 @@ def index():
 def tasks():
     """任务列表页面"""
     logger.info("访问任务列表页面")
-    
-    # 获取分页参数
+
     page = request.args.get('page', 1, type=int)
-    per_page = 20  # 每页显示20条记录
-    
-    # 获取分页数据
-    pagination_data = get_tasks_paginated(page=page, per_page=per_page)
+    per_page = request.args.get('per_page', 20, type=int)
+    per_page = min(100, max(10, per_page))
+    status_filter = (request.args.get('status') or '').strip()
+    keyword = (request.args.get('q') or '').strip()
+
+    pagination_data = get_tasks_paginated(
+        page=page, per_page=per_page,
+        status_filter=status_filter, keyword=keyword,
+    )
     config = load_config()
-    
-    return render_template('tasks.html', 
-                         tasks=pagination_data['tasks'],
-                         pagination=pagination_data,
-                         config=config)
+
+    return render_template(
+        'tasks.html',
+        tasks=pagination_data['tasks'],
+        pagination=pagination_data,
+        config=config,
+        status_counts=get_task_status_counts(),
+        filter_options=TASK_FILTER_OPTIONS,
+        current_filter=status_filter,
+        current_keyword=keyword,
+        current_per_page=per_page,
+        pace_status=get_upload_pace_status(config),
+    )
 
 
 def _render_task_fragments(task: dict, config: dict | None = None) -> dict:
@@ -2617,6 +2637,113 @@ def clear_all_tasks_route():
     except Exception as e:
         logger.error(f"清空所有任务失败: {e}")
         flash(f'清空任务失败: {e}', 'danger')
+    return redirect(url_for('tasks'))
+
+
+@app.route('/tasks/bulk_action', methods=['POST'])
+@login_required
+def tasks_bulk_action():
+    """对勾选的任务做出批量操作：上传 / 重试 / 删除。
+
+    前端以复选框传 task_ids（多值），action 决定具体动作。
+    只处理与动作匹配的状态，非法状态静默跳过并汇总到提示里。
+    """
+    action = (request.form.get('action') or '').strip()
+    task_ids = [t for t in request.form.getlist('task_ids') if t.strip()]
+    back = request.form.get('back') or url_for('tasks')
+
+    if not task_ids:
+        flash('请先勾选要操作的任务', 'warning')
+        return redirect(back)
+
+    config = load_config()
+    ok = skipped = failed = 0
+    failed_reasons = []
+
+    for task_id in task_ids:
+        task = get_task(task_id)
+        if not task:
+            skipped += 1
+            continue
+
+        try:
+            if action == 'upload':
+                # 仅“待上传 / 人工审核 / 已就绪”可上传
+                if task['status'] not in (
+                    TASK_STATES['READY_FOR_UPLOAD'],
+                    TASK_STATES['AWAITING_REVIEW'],
+                    TASK_STATES['PENDING'],
+                ):
+                    skipped += 1
+                    continue
+                if _start_bulk_force_upload(task_id, config):
+                    ok += 1
+                else:
+                    skipped += 1
+
+            elif action == 'retry':
+                if task['status'] != TASK_STATES['FAILED']:
+                    skipped += 1
+                    continue
+                update_task(
+                    task_id, silent=True,
+                    status=TASK_STATES['PENDING'],
+                    error_message=None, error_category=None,
+                    retry_after=None, upload_progress=None,
+                )
+                ok += 1
+
+            elif action == 'delete':
+                if delete_task(task_id):
+                    ok += 1
+                else:
+                    failed += 1
+
+            else:
+                flash(f'未知的批量操作: {action}', 'danger')
+                return redirect(back)
+
+        except Exception as exc:
+            failed += 1
+            failed_reasons.append(f'{task_id[:8]}: {exc}')
+
+    parts = []
+    label = {'upload': '上传', 'retry': '重试', 'delete': '删除'}.get(action, action)
+    if ok:
+        parts.append(f'已{label} {ok} 个任务')
+    if skipped:
+        parts.append(f'跳过 {skipped} 个（状态不符）')
+    if failed:
+        parts.append(f'失败 {failed} 个')
+    flash('，'.join(parts) or '未执行任何操作',
+          'success' if ok else 'warning')
+    if failed_reasons:
+        for reason in failed_reasons[:3]:
+            flash(reason, 'danger')
+
+    return redirect(back)
+
+
+def _start_bulk_force_upload(task_id, config):
+    """批量上传时逐条启动后台上传，返回是否已启动。"""
+    try:
+        _start_background_force_upload(task_id, config, 'Bilibili')
+        return True
+    except Exception as exc:
+        logger.warning("批量上传启动失败 %s: %s", task_id, exc)
+        return False
+
+
+@app.route('/tasks/daily_retry_now', methods=['POST'])
+@login_required
+def tasks_daily_retry_now():
+    """手动触发一次「重投前一天遗留投稿」，用于验证/临时补投。"""
+    try:
+        n = requeue_yesterday_upload_failures(load_config())
+        flash(f'已重新排队 {n} 个历史投稿任务', 'success' if n else 'info')
+    except Exception as exc:
+        logger.error("手动触发每日重投失败: %s", exc)
+        flash(f'重投失败: {exc}', 'danger')
     return redirect(url_for('tasks'))
 
 
@@ -4368,7 +4495,7 @@ if __name__ == '__main__':
     download_cleanup_scheduler = schedule_download_cleanup()
 
     try:
-        port = int(os.environ.get('PORT', 5000))
+        port = int(os.environ.get('PORT', 5001))
         logger.info(f"服务启动，监听地址: http://127.0.0.1:{port}")
         # 使用标准Flask运行
         app.run(host='0.0.0.0', port=port, debug=False)

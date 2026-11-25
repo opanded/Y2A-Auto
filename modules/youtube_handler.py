@@ -925,13 +925,47 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                     
                     output_lines = []
                     logger.info("开始读取yt-dlp输出...")
-                    
-                    # 确保process.stdout不为None且可迭代
-                    if process.stdout is None:
-                        logger.error("process.stdout为None，无法读取输出")
-                        raise RuntimeError("进程创建成功但stdout为None")
-                    
+
+                    # 看门狗：`for line in process.stdout` 是阻塞迭代，yt-dlp 若卡在
+                    # TLS 握手或元数据阶段会一行都不输出，主线程就永久挂在读取上
+                    # （表现为任务长期停在 downloading、子进程僵在几 MB 内存）。
+                    # 用独立线程监控「最后一次收到输出的时间」，静默超时即终止进程。
+                    import threading as _threading
+
+                    _last_output_at = [time.time()]
+                    try:
+                        _silent_timeout = int(
+                            str(config.get('YTDLP_SILENT_TIMEOUT_SECONDS') or 300).strip()
+                        )
+                    except (TypeError, ValueError):
+                        _silent_timeout = 300
+                    _silent_timeout = max(60, _silent_timeout)
+                    _watchdog_stop = _threading.Event()
+                    _watchdog_killed = [False]
+
+                    def _silent_watchdog():
+                        while not _watchdog_stop.wait(15):
+                            idle = time.time() - _last_output_at[0]
+                            if idle >= _silent_timeout:
+                                _watchdog_killed[0] = True
+                                logger.error(
+                                    "yt-dlp 已 %d 秒无任何输出（阈值 %d 秒），强制终止进程 PID %s",
+                                    int(idle), _silent_timeout, process.pid,
+                                )
+                                try:
+                                    process.kill()
+                                except Exception:
+                                    pass
+                                return
+
+                    _watchdog = _threading.Thread(
+                        target=_silent_watchdog, daemon=True,
+                        name=f'ytdlp-watchdog-{process.pid}',
+                    )
+                    _watchdog.start()
+
                     for line in process.stdout:
+                        _last_output_at[0] = time.time()
                         if cancel_event is not None and cancel_event.is_set():
                             logger.info("检测到任务取消请求，准备终止yt-dlp进程")
                             process.terminate()
@@ -981,8 +1015,24 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                                             break
                             except (ValueError, IndexError) as e:
                                 logger.debug(f"解析进度信息失败: {e}")
-                    
-                    process.wait()
+
+                    # 停止看门狗：stdout 已读完，后续由 wait 自己兜底
+                    _watchdog_stop.set()
+                    try:
+                        process.wait(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        logger.warning("yt-dlp 输出已读完但进程未退出，强制终止")
+                        try:
+                            process.kill()
+                        except Exception:
+                            pass
+                        process.wait(timeout=15)
+
+                    if _watchdog_killed[0]:
+                        raise RuntimeError(
+                            f"yt-dlp 静默超时（{_silent_timeout} 秒无输出）被终止"
+                        )
+
                     output = ''.join(output_lines)
 
                     if cancel_event is not None and cancel_event.is_set():

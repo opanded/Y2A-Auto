@@ -34,11 +34,100 @@
 
     <div id="tasksContent">
     {% if tasks %}
+    <!-- 筛选 + 统计 + 投稿节奏 -->
+    <div class="tasks-toolbar mb-3">
+        <form method="get" action="{{ url_for('tasks') }}" class="d-flex gap-2 flex-wrap align-items-center mb-2">
+            <select name="status" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
+                {% for value, label in filter_options %}
+                    <option value="{{ value }}" {% if value == current_filter %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+            </select>
+            <input type="search" name="q" value="{{ current_keyword }}" class="form-control form-control-sm"
+                   style="width:220px" placeholder="搜索标题（原文/译文）">
+            <select name="per_page" class="form-select form-select-sm" style="width:auto" onchange="this.form.submit()">
+                {% for n in [20, 50, 100] %}
+                    <option value="{{ n }}" {% if n == current_per_page %}selected{% endif %}>{{ n }} 条/页</option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-search"></i> 筛选
+            </button>
+            {% if current_filter or current_keyword %}
+                <a href="{{ url_for('tasks') }}" class="btn btn-sm btn-link">清除</a>
+            {% endif %}
+        </form>
+
+        <div class="d-flex gap-2 flex-wrap align-items-center">
+            {% set stat_labels = [
+                ('upload_pending', '待上传', 'primary'),
+                ('problem', '失败', 'danger'),
+                ('in_progress', '处理中', 'info'),
+                ('done', '已完成', 'success')
+            ] %}
+            {% set group_counts = {
+                'upload_pending': (status_counts.get('ready_for_upload', 0) + status_counts.get('awaiting_manual_review', 0) + status_counts.get('pending', 0)),
+                'problem': status_counts.get('failed', 0),
+                'in_progress': (status_counts.get('downloading', 0) + status_counts.get('uploading', 0) + status_counts.get('translating', 0) + status_counts.get('translating_subtitle', 0) + status_counts.get('tagging', 0) + status_counts.get('partitioning', 0) + status_counts.get('moderating', 0) + status_counts.get('encoding_video', 0) + status_counts.get('asr_transcribing', 0) + status_counts.get('fetching_info', 0) + status_counts.get('info_fetched', 0)),
+                'done': status_counts.get('completed', 0)
+            } %}
+            {% for key, label, color in stat_labels %}
+                <a class="badge rounded-pill bg-{{ color }} text-white text-decoration-none py-2 px-3"
+                   href="{{ url_for('tasks', status=key) }}">
+                    {{ label }} {{ group_counts[key] }}
+                </a>
+            {% endfor %}
+
+            {% if pace_status and pace_status.enabled %}
+                <span class="vr d-none d-lg-inline"></span>
+                <span class="small text-muted">
+                    <i class="bi bi-speedometer2"></i> 投稿节奏：
+                    本小时 {{ pace_status.used_last_hour }}/{{ pace_status.hourly_limit }}
+                    {% if pace_status.slowdown_factor > 1 %}
+                        <span class="badge bg-warning text-dark">已降速 ×{{ pace_status.slowdown_factor }}</span>
+                    {% endif %}
+                    {% if pace_status.penalty_active %}
+                        <span class="badge bg-danger text-white">限流冷却至 {{ pace_status.penalty_until }}</span>
+                    {% elif pace_status.can_upload_now %}
+                        <span class="badge bg-success text-white">可上传</span>
+                    {% else %}
+                        <span class="badge bg-secondary text-white">下一次 {{ pace_status.next_upload_at }}</span>
+                    {% endif %}
+                </span>
+            {% endif %}
+
+            <form method="post" action="{{ url_for('tasks_daily_retry_now') }}" class="ms-auto">
+                <button type="submit" class="btn btn-sm btn-outline-secondary"
+                        title="立即重投前一天遗留的投稿（正常由每天 00:30 自动执行）">
+                    <i class="bi bi-clock-history"></i> 重投历史投稿
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <form method="post" action="{{ url_for('tasks_bulk_action') }}" id="bulkActionForm">
+    <div class="bulk-action-bar" id="bulkActionBar" hidden>
+        <input type="hidden" name="back" value="{{ request.full_path }}">
+        <div class="d-flex align-items-center gap-2 flex-wrap">
+            <span class="text-muted small">已选 <strong id="bulkCount">0</strong> 项</span>
+            <button type="submit" name="action" value="upload" class="btn btn-sm btn-primary">
+                <i class="bi bi-cloud-arrow-up"></i> 批量上传
+            </button>
+            <button type="submit" name="action" value="retry" class="btn btn-sm btn-outline-warning">
+                <i class="bi bi-arrow-repeat"></i> 批量重试
+            </button>
+            <button type="submit" name="action" value="delete" class="btn btn-sm btn-outline-danger"
+                    onclick="return confirm('确定删除选中的任务？对应本地文件也会一并删除。')">
+                <i class="bi bi-trash"></i> 批量删除
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="bulkClearBtn">取消选择</button>
+        </div>
+    </div>
     <div class="modern-list">
         <!-- 桌面端表格（md及以上显示） -->
         <div class="table-responsive modern-table d-none d-md-block">
                 <table class="table table-striped table-hover table-borderless table-sm align-middle mb-0 tasks-table no-min-width">
                     <colgroup>
+                        <col class="col-select">
                         <col class="col-id">
                         <col class="col-title">
                         <col class="col-status">
@@ -51,6 +140,10 @@
                     </colgroup>
                     <thead class="table-light">
                         <tr>
+                            <th class="col-select">
+                                <input type="checkbox" class="form-check-input" id="selectAllTasks"
+                                       title="全选当前页" aria-label="全选当前页">
+                            </th>
                             <th class="col-id">ID</th>
                             <th class="col-title">视频标题</th>
                             <th class="col-status">状态</th>
@@ -69,6 +162,7 @@
                     </tbody>
                 </table>
         </div>
+    </form>
 
         <!-- 移动端卡片（md以下显示） -->
         <div class="d-block d-md-none">
@@ -79,9 +173,29 @@
             </div>
         </div>
     </div>
+
+    <!-- 移动端批量操作：卡片没有复选框，提供按状态批量入口 -->
+    <div class="d-block d-md-none mt-3">
+        <div class="d-flex gap-2 flex-wrap">
+            <a class="btn btn-sm btn-outline-primary"
+               href="{{ url_for('tasks', status='upload_pending') }}">
+                <i class="bi bi-cloud-arrow-up"></i> 查看待上传
+            </a>
+            <a class="btn btn-sm btn-outline-danger"
+               href="{{ url_for('tasks', status='problem') }}">
+                <i class="bi bi-exclamation-triangle"></i> 查看失败
+            </a>
+        </div>
+    </div>
     {% else %}
     <div class="alert alert-info">
-        <i class="bi bi-info-circle"></i> 暂无任务，请点击"新建任务"按钮添加任务。
+        <i class="bi bi-info-circle"></i>
+        {% if current_filter or current_keyword %}
+            当前筛选条件下没有任务。
+            <a href="{{ url_for('tasks') }}" class="alert-link">清除筛选</a>
+        {% else %}
+            暂无任务，请点击"新建任务"按钮添加任务。
+        {% endif %}
     </div>
     {% endif %}
     
@@ -1207,6 +1321,62 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             }
         });
     });
+
+    // ---------------------------------------------------------------- 批量选择
+    // 全程使用事件委托 + 惰性查询，不依赖初始化时机：
+    // 后台刷新会替换整个 #tasksContent，任何缓存的元素引用都会失效。
+    (function initBulkSelection() {
+        if (window.__bulkSelectionInstalled) return;
+        window.__bulkSelectionInstalled = true;
+
+        function bar() { return document.getElementById('bulkActionBar'); }
+        function countEl() { return document.getElementById('bulkCount'); }
+        function boxes() {
+            return Array.from(document.querySelectorAll('.task-select-checkbox'));
+        }
+
+        function refresh() {
+            const b = bar();
+            const c = countEl();
+            if (!b || !c) return;
+            const checked = boxes().filter((x) => x.checked);
+            c.textContent = String(checked.length);
+            b.hidden = checked.length === 0;
+
+            const selAll = document.getElementById('selectAllTasks');
+            if (selAll) {
+                const all = boxes();
+                selAll.checked = all.length > 0 && checked.length === all.length;
+                selAll.indeterminate = checked.length > 0 && checked.length < all.length;
+            }
+        }
+
+        // 统一在 document 上监听，刷新替换 DOM 后依然有效
+        document.addEventListener('change', function (e) {
+            const t = e.target;
+            if (!t) return;
+            if (t.classList && t.classList.contains('task-select-checkbox')) {
+                refresh();
+            } else if (t.id === 'selectAllTasks') {
+                boxes().forEach((x) => { x.checked = t.checked; });
+                refresh();
+            }
+        });
+
+        document.addEventListener('click', function (e) {
+            const t = e.target;
+            if (t && t.id === 'bulkClearBtn') {
+                e.preventDefault();
+                boxes().forEach((x) => { x.checked = false; });
+                refresh();
+            }
+        });
+
+        // 后台刷新后同步一次计数（勾选状态会随 DOM 重建而丢失，这是预期行为）
+        document.addEventListener('y2a:tasks-refreshed', refresh);
+        window.addEventListener('load', refresh);
+        refresh();
+    })();
 </script>
 {% endblock %} 
 
