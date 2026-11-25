@@ -54,6 +54,7 @@
 | 审核可控 | 支持人工审核、强制上传、内容安全检测和登录保护 |
 | 灵活部署 | Docker / 本地双模式，支持 CPU 与多种 GPU 编码 |
 | 监控拉取 | 支持 YouTube 频道 / 关键词定时抓取与历史记录 |
+| 投稿节奏控制 | 自适应节流 + 平台限流延迟重试 + 每日凌晨自动重投，规避日配额上限 |
 | 消息推送 | 企业微信、Server酱、message-pusher 多渠道异步通知 |
 | CookieCloud | 从 CookieCloud 服务自动同步 YouTube Cookies |
 | 安全防护 | 密码保护、暴力破解锁定、会话超时、路径遍历防护 |
@@ -67,9 +68,16 @@
   - 字幕翻译、字幕后处理、字幕质检（QC）与字幕烧录
   - AI 生成标题、简介、标签与分区推荐
   - 内容安全审核（阿里云 Green）
+  - 投稿前敏感词替换，避免平台侧改写标题
   - 自动上传到 AcFun / bilibili / 双平台
+  - 上传节流：最小间隔 + 每小时配额，按积压量自动切换松紧档
+  - 平台限流（B站 137022）排入延迟队列按小时级冷却重试
+  - 每日凌晨自动重投前一天遗留的投稿
 - Web 管理后台
-  - 任务列表、人工审核、强制上传
+  - 任务列表：状态筛选、标题搜索、分页、批量上传 / 重试 / 删除
+  - 按任务状态给出对应操作（处理中可中止、限流中显示重试时刻、永久失败标记不可重试）
+  - 人工审核、强制上传
+  - 投稿节奏面板：显示本小时用量、限流冷却截止时间、降速倍数
   - 设置中心分组管理：运行概览、账号与网络、内容审核、AI 模型、字幕处理、语音识别、视频转码、监控与维护、安全
   - 登录保护、错误次数锁定和密码管理
 - YouTube 监控
@@ -249,6 +257,7 @@ python app.py
 - `YOUTUBE_API_PROXY_ENABLED` / `YOUTUBE_API_PROXY_URL`：YouTube 监控 API 独立代理，不继承下载代理
 - `YOUTUBE_DOWNLOAD_THREADS`：下载线程数
 - `YOUTUBE_THROTTLED_RATE`：下载速度限制
+- `YTDLP_SILENT_TIMEOUT_SECONDS`：yt-dlp 静默超时，默认 `300` 秒，下限 `60`。yt-dlp 连续这么久没有任何输出即判定卡死并终止。读取子进程 stdout 是阻塞操作，yt-dlp 卡在 TLS 握手或元数据阶段时一行输出都不产生，主线程会永久挂起，表现为任务长期停在 `downloading`、子进程僵在几 MB 内存
 - `YOUTUBE_API_KEY`：YouTube Data API v3 密钥，监控功能需要
 - `FFMPEG_LOCATION`：自定义 FFmpeg 路径
 - `FFMPEG_AUTO_DOWNLOAD`：Windows 缺失时自动下载 FFmpeg，默认 `true`
@@ -276,6 +285,48 @@ python app.py
 - `PRESET_TAGS_ENABLED` / `PRESET_TAGS`：预设标签，每行一个（也接受逗号、顿号、分号分隔）。启用后预设标签排在任务标签之前，`GENERATE_TAGS` 开启时 AI 只补齐剩余名额；一份预设同时服务 AcFun（前 6 个、每个约 10 字）与 bilibili（最多 12 个、每个 20 字）
 
 AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_BASE_URL` 可填写 API 根地址（例如 `https://api.openai.com/v1`，默认使用 Chat Completions）或完整的 `/chat/completions`、`/responses` 地址；填写完整端点时会自动选择协议并规范化。Responses 请求会自动转换消息、JSON 输出格式、思考开关和 token 上限参数，返回值也会归一化供翻译、质检、智能分段等现有功能使用。当兼容服务不支持 `response_format`、token 上限参数、自定义 `temperature` 或特定指令角色时，系统会根据端点实际错误逐级协商；若网关只返回笼统的请求 schema 错误，则降级为仅含 `model + user messages` 的最小标准请求。能力只在降级请求成功后按端点、协议和模型缓存。
+
+### 上传节流与自动重投
+
+平台对短时间批量投稿有风控。bilibili 返回 `137022「投稿过于频繁」`，且该限制按自然日计算——实测间隔 19 小时仍被拒绝，只能等次日配额重置。以下开关用于避免批量投稿撞墙。
+
+**主动节流**
+
+- `UPLOAD_PACE_ENABLED`：启用上传节奏控制，默认 `true`。上传信号量只限制「同时几个上传」，限不住「一条接一条」的发送速度；实测最小间隔 1 秒、中位 38 秒的连发约 24 条后即触发平台限流
+- `UPLOAD_PACE_ADAPTIVE`：按待上传积压量自动切换两档，默认 `true`
+- `UPLOAD_PACE_BACKLOG_THRESHOLD`：积压超过该值使用保守档，默认 `5`
+- `UPLOAD_MIN_INTERVAL_SECONDS` / `UPLOAD_MAX_PER_HOUR`：保守档节奏，默认 `600` 秒 / `3` 条每小时
+- `UPLOAD_MIN_INTERVAL_SECONDS_FAST` / `UPLOAD_MAX_PER_HOUR_FAST`：放宽档节奏，默认 `300` 秒 / `6` 条每小时
+
+节流采用**非阻塞**实现：不满足节奏时任务立即放回队列并写入 `retry_after`，由扫描器到期重新拾取。早期实现用 `sleep` 阻塞等待，会把调度器线程池睡满，导致 pending 扫描与定时重投被判 `missed` 丢弃。
+
+**延迟重试**
+
+- `UPLOAD_RATE_LIMIT_RETRY_ENABLED`：平台限流时排入延迟队列，默认 `true`
+- `UPLOAD_RATE_LIMIT_RETRY_MINUTES`：冷却时长，默认 `120` 分钟
+- `UPLOAD_RATE_LIMIT_MAX_RETRIES`：最多退避轮数，默认 `5`；`0` 表示不限
+
+**其它重试**
+
+- `UPLOAD_NETWORK_MAX_ATTEMPTS` / `UPLOAD_NETWORK_RETRY_DELAY`：传输层错误（超时、连接重置）的重试次数与间隔，默认 `3` 次 / `15` 秒
+- `UPLOAD_THROTTLE_RETRY_DELAY`：preupload `406` 的冷却时间，默认 `180` 秒
+
+重试只针对可恢复错误。账号级风控（`-352` / `603` / cookie 失效）与地区限制、视频已删除等永久性失败不会重试。
+
+**每日凌晨自动重投**
+
+- `DAILY_UPLOAD_RETRY_ENABLED`：启用每日重投，默认 `true`
+- `DAILY_UPLOAD_RETRY_HOUR` / `DAILY_UPLOAD_RETRY_MINUTE`：触发时间，默认 `0:30`
+
+覆盖三类遗留任务：素材齐备但未投出的 `ready_for_upload`、上传阶段失败的 `failed`、冷却已到期却没跑到的 `pending`。跳过永久性下载失败与当天新建的任务。任务页顶部的「重投历史投稿」按钮可手动触发一次。
+
+**投稿前敏感词替换**
+
+平台会自行屏蔽并篡改标题中的敏感词，主动替换可避免平台侧改写影响曝光。
+
+- `SENSITIVE_WORD_REPLACE_ENABLED`：启用替换，默认 `true`
+- `SENSITIVE_WORD_REPLACE_MAP`：JSON 对象，形如 `{"原文":"替代词"}`；按原文长度降序匹配（长词优先），替换幂等
+- `SENSITIVE_WORD_REPLACE_TARGETS`：生效字段，默认 `title,description,tags`
 
 ### 字幕处理
 
@@ -340,11 +391,11 @@ AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_
 ### 通知推送
 
 - `NOTIFY_ENABLED`：启用消息推送，默认 `false`
-- `NOTIFY_CHANNELS`：启用的渠道列表，支持 `wecom`、`serverchan`、`message_pusher`
-- `NOTIFY_EVENTS`：订阅的事件列表，可选 `task_added`、`task_completed`、`task_failed`、`login_success`、`login_locked`、`qr_login_success`、`qr_login_failed`
-- 企业微信：`NOTIFY_WECOM_WEBHOOK_URL`
-- Server酱：`NOTIFY_SERVERCHAN_SENDKEY`
-- message-pusher：`NOTIFY_MESSAGE_PUSHER_SERVER` / `NOTIFY_MESSAGE_PUSHER_USERNAME` / `NOTIFY_MESSAGE_PUSHER_TOKEN`
+- 渠道为独立开关，可自由组合启用：
+  - 企业微信：`NOTIFY_WECOM_ENABLED` / `NOTIFY_WECOM_WEBHOOK_URL`
+  - Server酱：`NOTIFY_SERVERCHAN_ENABLED` / `NOTIFY_SERVERCHAN_SENDKEY`
+  - message-pusher：`NOTIFY_MESSAGE_PUSHER_ENABLED` / `NOTIFY_MESSAGE_PUSHER_SERVER` / `NOTIFY_MESSAGE_PUSHER_USERNAME` / `NOTIFY_MESSAGE_PUSHER_TOKEN` / `NOTIFY_MESSAGE_PUSHER_CHANNEL`
+- 事件订阅同样是独立开关，默认全开：`NOTIFY_EVENT_TASK_ADDED`、`NOTIFY_EVENT_TASK_COMPLETED`、`NOTIFY_EVENT_TASK_FAILED`、`NOTIFY_EVENT_LOGIN_SUCCESS`、`NOTIFY_EVENT_LOGIN_LOCKED`、`NOTIFY_EVENT_QR_LOGIN_SUCCESS`、`NOTIFY_EVENT_QR_LOGIN_FAILED`
 
 ### CookieCloud
 
@@ -352,7 +403,8 @@ AI 文本功能同时兼容 OpenAI Chat Completions 与 Responses API。`OPENAI_
 - `COOKIECLOUD_SERVER_URL`：CookieCloud 服务地址
 - `COOKIECLOUD_UUID`：CookieCloud UUID
 - `COOKIECLOUD_PASSWORD`：CookieCloud 加密密码
-- `COOKIECLOUD_ENCRYPT_MODE`：加密模式，支持 `auto` / `legacy` / `aes-128-cbc-fixed`
+- `COOKIECLOUD_CRYPTO_TYPE`：加密模式，支持 `auto` / `legacy` / `aes-128-cbc-fixed`
+- `COOKIECLOUD_ALLOW_PLAINTEXT_EXPORT`：是否允许导出明文，默认 `false`
 
 ### 内容审核
 
@@ -512,6 +564,19 @@ group_add:
 - 支持视频类型筛选：video / short / live
 - 可设置自动添加到任务队列，并保留监控历史记录
 - 配置文件会保存到 `config/youtube_monitor/`，历史数据库位于 `db/youtube_monitor.db`
+
+### 抓取与入队的配额约束
+
+- `MONITOR_DAILY_ENQUEUE_CAP`：每日入队总上限，默认 `25`，`0` 表示不限。多个监控配置同时到点时，各自的 `rate_limit_requests` 会叠加，一次涌入上百条任务远超实际投稿能力
+- 同一间隔的多个配置会按 ID 错开首次触发时间（每个错开 1 分钟）。实测 11 个配置同秒起跑会集中发起大量频道请求，把代理连接打爆（`SSL: WRONG_VERSION_NUMBER`）
+- `historical` 模式默认遍历整个上传列表，不再限制 500 条；可用 `historical_max_videos` 单独设上限。`videos.list` 的 id 参数单次上限 50，已自动分批请求
+- 入队时会用监控阶段已抓到的标题与简介预填任务，任务列表无需等待 `fetch_info` 就能显示内容
+
+### 频道选择建议
+
+YouTube 没有「按类目 + 订阅数」的枚举接口，也无法从作品名可靠地反查官方频道：全站关键词搜索的污染率实测超过 85%（个人解说、搬运、柏青哥店等），`- Topic` 频道则是 `videoCount=0` 的艺人实体，没有上传列表。
+
+可行的做法是「维基百科 → 作品官网 → 视频页里嵌入的 YouTube 播放器 → 反查频道」。实测 Aniplex 参与制作的作品（含《3月的狮子》《伪恋》）宣发视频统一投放在 Aniplex 频道，而非电视台或出版社频道。
 
 ## 通知推送
 
