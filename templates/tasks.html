@@ -766,11 +766,15 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             }
         }
 
+        // 刚被服务端 HTML 覆盖，手动上传的进度条要贴回去
+        if (replaced) {
+            restoreManualUploadIndicators();
+        }
+
         return replaced;
     }
 
-    function applyTaskProgressUpdate(taskId, payload) {
-        if (!taskId || !payload) return;
+    function applyTaskProgressUpdate(taskId, payload) {        if (!taskId || !payload) return;
 
         const escapedTaskId = escapeTaskIdForSelector(taskId);
         const progressText = typeof payload.upload_progress === 'string' ? payload.upload_progress : '';
@@ -781,6 +785,9 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
             el.textContent = progressText;
             el.classList.toggle('d-none', !hasText);
         });
+
+        // 手动上传时就地展开的进度条也跟着推进
+        setUploadProgressState(taskId, payload);
 
         if (dateTimeValue) {
             document.querySelectorAll(`[data-task-id="${escapedTaskId}"] [data-task-datetime]`).forEach(function(el) {
@@ -858,6 +865,8 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         initTooltips();
         updateTaskDateTimes();
         updateProgressBars();
+        // 整块内容替换同样会冲掉手动上传的进度条，贴回去
+        restoreManualUploadIndicators();
     }
 
     function scheduleApplyPendingTasksContent() {
@@ -1002,6 +1011,14 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 }
 
                 if (payload.type === 'task_updated') {
+                    // 进度状态只在任务真正落到终态（完成/失败）时才清。
+                    // 注意上传启动瞬间状态仍是 pending（后台线程还没接手），
+                    // 此时若清掉，刚显示的进度条会立刻消失（实测点完 1 秒就没了）。
+                    const newStatus = eventData.status;
+                    if (manualUploadState.has(taskId) &&
+                        (newStatus === 'completed' || newStatus === 'failed')) {
+                        forgetUploadState(taskId);
+                    }
                     refreshTaskFragment(taskId);
                     return;
                 }
@@ -1102,6 +1119,200 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 );
             });
         });
+
+        // 「立即上传」等上传操作不再整页跳转：
+        // 提交后就在任务行里展开进度条，进度由 SSE 的 task_progress 事件推进。
+        queryAllWithin(root, 'form[data-ajax-upload="1"]').forEach(form => {
+            if (form.dataset.bindAjaxUpload === '1') return;
+            form.dataset.bindAjaxUpload = '1';
+            form.addEventListener('submit', handleAjaxUploadSubmit);
+        });
+    }
+
+    // --- 上传进度：AJAX 提交 + 就地进度条 -------------------------------------
+    //
+    // 注意：SSE 的 task_updated 会触发 refreshTaskFragment()，用服务端返回的
+    // 新 HTML 整行替换——刚显示出来的进度条会被一起冲掉（实测点「立即上传」
+    // 后进度条闪现即消失）。所以把「这条任务正在手动上传」记在内存里，
+    // 每次行被替换后重新贴回去。
+
+    const manualUploadState = new Map();  // taskId -> {percent, text, failed}
+
+    function rememberUploadState(taskId, patch) {
+        if (!taskId) return;
+        const prev = manualUploadState.get(taskId) || { percent: 0, text: '', failed: false };
+        manualUploadState.set(taskId, Object.assign({}, prev, patch));
+    }
+
+    function forgetUploadState(taskId) {
+        if (taskId) manualUploadState.delete(taskId);
+    }
+
+    /** 行/卡片被服务端 HTML 替换后，把进度条状态重新贴回当前 DOM。 */
+    function restoreManualUploadIndicators() {
+        manualUploadState.forEach(function (state, taskId) {
+            if (state.failed) {
+                markUploadFailed(taskId, state.text);
+            } else {
+                showUploadProgress(taskId, { percent: state.percent, text: state.text });
+            }
+            // 按钮也要回到「上传中」不可重复点的样子（表格行和卡片各一份）
+            const selector = `[data-task-id="${escapeTaskIdForSelector(taskId)}"]`;
+            document.querySelectorAll(selector).forEach(function (row) {
+                const btn = row.querySelector('form[data-ajax-upload="1"] button[type="submit"]');
+                if (btn && !state.failed) {
+                    btn.disabled = true;
+                    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>上传中…';
+                }
+            });
+        });
+    }
+
+    /**
+     * 同一任务在 DOM 里有两份：桌面表格行 + 窄屏卡片，另一份只是用 d-none 隐藏。
+     * 用 querySelector 只会命中排在前面的那份（窄屏下正好是隐藏的表格行），
+     * 于是进度条更新到了看不见的节点上。所以这里一律返回数组，操作全部命中项。
+     */
+    function findTaskUploadProgressBoxes(taskId) {
+        if (!taskId) return [];
+        const selector = `[data-task-id="${escapeTaskIdForSelector(taskId)}"] [data-task-upload-progress]`;
+        return Array.prototype.slice.call(document.querySelectorAll(selector));
+    }
+
+    /**
+     * 从 upload_progress 文本里取出百分比。
+     * 后端可能推 "37.5%"、"37.5"、"上传中..." 等形态，取不到就返回 null。
+     */
+    function parseProgressPercent(text) {
+        if (typeof text !== 'string') return null;
+        const match = text.match(/(\d+(?:\.\d+)?)\s*%?/);
+        if (!match) return null;
+        const value = parseFloat(match[1]);
+        if (!isFinite(value) || value < 0) return null;
+        return Math.max(0, Math.min(100, value));
+    }
+
+    function showUploadProgress(taskId, opts) {
+        const boxes = findTaskUploadProgressBoxes(taskId);
+        if (!boxes.length) return null;
+        const options = opts || {};
+        boxes.forEach(function (box) {
+            box.classList.remove('d-none');
+            const bar = box.querySelector('[data-task-upload-bar]');
+            const label = box.querySelector('[data-task-upload-label]');
+            if (bar && options.percent !== undefined && options.percent !== null) {
+                bar.style.width = options.percent + '%';
+                bar.setAttribute('aria-valuenow', String(Math.round(options.percent)));
+            }
+            if (label && options.text !== undefined) {
+                label.textContent = options.text;
+            }
+            // 进度条已显示百分比，隐藏原来那行文字，避免同一个数字出现两次
+            const legacy = box.parentElement
+                ? box.parentElement.querySelector('[data-task-progress]')
+                : null;
+            if (legacy) legacy.classList.add('d-none');
+        });
+        return boxes[0];
+    }
+
+    function setUploadProgressState(taskId, payload) {
+        const boxes = findTaskUploadProgressBoxes(taskId);
+        if (!boxes.length) return;
+
+        const progressText = typeof payload.upload_progress === 'string'
+            ? payload.upload_progress.trim()
+            : '';
+        const percent = parseProgressPercent(progressText);
+
+        if (percent !== null) {
+            showUploadProgress(taskId, { percent: percent, text: progressText });
+            rememberUploadState(taskId, { percent: percent, text: progressText });
+        } else if (progressText) {
+            // 拿不到百分比（例如「合并中…」），进度条保持当前值，只更新文案
+            showUploadProgress(taskId, { text: progressText });
+            rememberUploadState(taskId, { text: progressText });
+        }
+    }
+
+    function markUploadFailed(taskId, message) {
+        const boxes = findTaskUploadProgressBoxes(taskId);
+        if (!boxes.length) return;
+        boxes.forEach(function (box) {
+            box.classList.remove('d-none');
+            const bar = box.querySelector('[data-task-upload-bar]');
+            const label = box.querySelector('[data-task-upload-label]');
+            if (bar) {
+                bar.classList.remove('bg-success', 'progress-bar-animated', 'progress-bar-striped');
+                bar.classList.add('bg-danger');
+                bar.style.width = '100%';
+            }
+            if (label) {
+                label.textContent = message || '上传失败';
+                label.classList.add('text-danger');
+            }
+        });
+        rememberUploadState(taskId, { failed: true, text: message || '上传失败' });
+    }
+
+    async function handleAjaxUploadSubmit(event) {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const row = form.closest('[data-task-id]');
+        const taskId = row ? row.dataset.taskId : '';
+        const button = form.querySelector('button[type="submit"]');
+        if (button && button.disabled) return;
+
+        if (button) {
+            button.disabled = true;
+            button.dataset.originalHtml = button.innerHTML;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>启动中…';
+        }
+        // 必须先记状态再显示：SSE 的 task_updated 随时可能整行替换，
+        // 只有记在 manualUploadState 里，restoreManualUploadIndicators 才能贴回来。
+        rememberUploadState(taskId, { percent: 0, text: '正在启动上传…' });
+        showUploadProgress(taskId, { percent: 0, text: '正在启动上传…' });
+
+        try {
+            const response = await fetch(form.action, {
+                method: 'POST',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json',
+                },
+                body: new FormData(form),
+                credentials: 'same-origin',
+            });
+            const data = await response.json().catch(() => ({}));
+
+            if (!response.ok || !data.ok) {
+                markUploadFailed(taskId, data.error || '启动上传失败');
+                if (data.needs_partition && data.edit_url) {
+                    // 缺分区必须先选，这条只能跳转，但把原因说清楚再跳
+                    setTimeout(() => { window.location.href = data.edit_url; }, 1200);
+                }
+                if (button) {
+                    button.disabled = false;
+                    button.innerHTML = button.dataset.originalHtml || '立即上传';
+                }
+                return;
+            }
+
+            // 启动成功：按钮换成「上传中」，进度条等 SSE 推 task_progress
+            rememberUploadState(taskId, { percent: 0, text: data.message || '已开始上传…' });
+            showUploadProgress(taskId, { percent: 0, text: data.message || '已开始上传…' });
+            if (button) {
+                // 不恢复可点：重复点击会重复起一次上传
+                button.innerHTML = '<span class="spinner-border spinner-border-sm me-1" role="status" aria-hidden="true"></span>上传中…';
+            }
+        } catch (err) {
+            console.error('启动上传失败:', err);
+            markUploadFailed(taskId, '网络错误，请重试');
+            if (button) {
+                button.disabled = false;
+                button.innerHTML = button.dataset.originalHtml || '立即上传';
+            }
+        }
     }
 
     function disposeTooltips(root = document) {

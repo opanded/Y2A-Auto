@@ -2815,27 +2815,50 @@ def retry_metadata_translation_route(task_id):
 @app.route('/tasks/<task_id>/force_upload', methods=['POST'])
 @login_required
 def force_upload_task_route(task_id):
-    """强制上传任务"""
+    """强制上传任务。
+
+    AJAX 请求（任务列表里的「立即上传」）返回 JSON 并不跳页，
+    让前端就地把按钮换成进度条；普通表单提交保持原有的 flash + 重定向。
+    """
+    wants_json = _is_ajax_request()
     task = get_task(task_id)
-    
+
     if not task:
+        if wants_json:
+            return jsonify({'ok': False, 'error': '任务不存在'}), 404
         flash('任务不存在', 'danger')
         return redirect(url_for('manual_review'))
-    
+
     # 获取当前配置
     config = load_config()
     upload_target = str(task.get('upload_target') or 'acfun').lower()
     platform_name = '双平台' if upload_target == 'both' else ('bilibili' if upload_target == 'bilibili' else 'AcFun')
     missing_partitions = _missing_upload_partition_labels(task, config)
     if missing_partitions:
-        flash(f'请先选择{ "、".join(missing_partitions) }，或开启分区推荐后再继续上传。', 'danger')
+        message = f'请先选择{ "、".join(missing_partitions) }，或开启分区推荐后再继续上传。'
+        if wants_json:
+            return jsonify({
+                'ok': False,
+                'error': message,
+                'needs_partition': True,
+                'edit_url': url_for('edit_task', task_id=task_id),
+            }), 400
+        flash(message, 'danger')
         return redirect(url_for('edit_task', task_id=task_id))
-    
-    # 启动后台强制上传
-    flash(f'已启动强制上传到{platform_name}，正在后台处理...', 'info')
 
+    # 启动后台强制上传
     _start_background_force_upload(task_id, config, platform_name)
 
+    if wants_json:
+        # 立刻回一个「已启动」，进度随后由 SSE 的 task_progress 事件推送。
+        return jsonify({
+            'ok': True,
+            'task_id': task_id,
+            'platform': platform_name,
+            'message': f'已启动上传到{platform_name}',
+        })
+
+    flash(f'已启动强制上传到{platform_name}，正在后台处理...', 'info')
     return redirect(url_for('manual_review'))
 
 @app.route('/tasks/reset_stuck', methods=['POST'])
