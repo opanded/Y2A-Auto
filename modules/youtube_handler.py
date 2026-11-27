@@ -369,10 +369,42 @@ def _looks_like_youtube_bot_challenge(error_text: str | None) -> bool:
         "not a bot",
         "Signature extraction failed",
         "Some formats may be missing",
+        "n challenge solving failed",
         "HTTP Error 403",
         "player",
         "decodeURIComponent",
         "The page needs to be reloaded.",
+    )
+    return any(indicator in normalized for indicator in indicators)
+
+
+def _looks_like_transient_network_error(error_text: str | None) -> bool:
+    """判断失败是否来自网络抖动而非视频本身不可用。
+
+    预检用非零退出码判断「不可用」，但 n-challenge 解不出来、TLS 被中间设备
+    打断这类问题同样返回非零——实测两条被标记「视频不可用或无法访问」的视频
+    其实仍是 public。把这类错误当成永久失败会让任务再也无法重试。
+    """
+    if not error_text:
+        return False
+    normalized = str(error_text)
+    indicators = (
+        "EOF occurred in violation of protocol",
+        "UNEXPECTED_EOF_WHILE_READING",
+        "DECRYPTION_FAILED_OR_BAD_RECORD_MAC",
+        "WRONG_VERSION_NUMBER",
+        "Connection reset",
+        "Connection aborted",
+        "Remote end closed connection",
+        "timed out",
+        "Timeout",
+        "Temporary failure in name resolution",
+        "Failed to download m3u8",
+        "Unable to download",
+        # 反机器人/JS 挑战解不出：视频本身仍然存在，属环境问题
+        "n challenge solving failed",
+        "Sign in to confirm",
+        "HTTP Error 403",
     )
     return any(indicator in normalized for indicator in indicators)
 
@@ -802,8 +834,17 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                 else:
                     logger.warning("CookieCloud同步失败: %s", sync_info)
             if not available:
-                logger.error("视频不可用或无法访问")
-                return False, "视频不可用或无法访问"
+                # 预检失败不等于视频不存在：n-challenge 解不出、TLS 被中间设备
+                # 打断时同样返回非零退出码，而这些视频本身仍然可播。
+                # 这类情况继续进入下载阶段，由 yt-dlp 自己重试，避免把可用视频判死。
+                if _looks_like_transient_network_error(error_msg):
+                    logger.warning(
+                        "视频预检查遇到网络/风控瞬时错误，继续进入下载阶段重试: %s",
+                        (error_msg or '')[:200],
+                    )
+                else:
+                    logger.error("视频不可用或无法访问")
+                    return False, "视频不可用或无法访问"
 
         if not available and error_msg and _looks_like_youtube_bot_challenge(error_msg):
             # 对于同时存在格式/访问混合异常的场景，保留诊断日志但不阻塞后续下载重试

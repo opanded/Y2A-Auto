@@ -178,6 +178,11 @@ async def _probe() -> dict:
     测试所有线路
 
     测速网页 https://member.bilibili.com/preupload?r=ping
+
+    所有线路都测速失败时不能返回 None：调用方会用 line["os"] 等字段拼
+    preupload 参数，None 会抛 "'NoneType' object is not subscriptable"，
+    上传在 preupload 阶段直接失败，且错误信息完全看不出是线路探测的问题。
+    这里回退到 LINES_INFO 的第一条，让上传至少能尝试一次。
     """
     # api = _API["probe"]
     # info = await Api(**api).update_params(r="probe").result # 不实时获取线路直接用 LINES_INFO
@@ -200,6 +205,14 @@ async def _probe() -> dict:
         if cost_time < min_cost:
             min_cost, fastest_line = cost_time, line
     request_settings.set_timeout(legacy_timeout)
+    if fastest_line is None:
+        # 全部线路超时/异常：退回默认线路，避免上层拿到 None 崩在取字段处
+        import logging
+        logging.getLogger(__name__).warning(
+            "上传线路测速全部失败（%d 条），回退到默认线路 %s",
+            len(LINES_INFO), next(iter(LINES_INFO), None),
+        )
+        fastest_line = next(iter(LINES_INFO.values()), None)
     return fastest_line
 
 
@@ -1097,6 +1110,12 @@ class VideoUploader(AsyncEvent):
         """
 
         self.line = await _choose_line(self.line)
+        # _choose_line 在极端情况（线路表为空/探测异常）可能返回 None，
+        # 后续 _preupload 会以 line["os"] 拼参数而抛 TypeError。
+        # 这里显式失败，把原因说清楚，而不是让上层收到一句
+        # "'NoneType' object is not subscriptable"。
+        if not self.line:
+            raise ApiException("无法确定 bilibili 上传线路（线路表为空或探测失败）")
         task = create_task(self._main())
         self.__task = task
 

@@ -776,13 +776,17 @@ def _is_permanent_download_failure(error_message) -> bool:
 
     典型：地区限制（uploader has not made this video available in your
     country）、视频已删除/私有、账号受限。这类重试只会反复失败。
+
+    注意「视频不可用或无法访问」这条中文提示本身不做判据：它来自预检的非零
+    退出码，而 n-challenge 失败、TLS 被中间设备打断同样返回非零——实测被它
+    标记的两条视频当时仍是 public。这类交由具体原因判定，避免误杀。
     """
     text = str(error_message or '').lower()
     if not text:
         return False
     permanent_markers = (
         'not available in your count',      # 地区限制（原文被截断）
-        'not available in your country',
+        'available in your country',        # 「...video available in your country」
         'video unavailable',
         'has been removed',
         'this video is private',
@@ -928,6 +932,17 @@ def _is_retryable_upload_error(result) -> bool:
     if 'preupload' in text and '406' in text:
         return True
     if '406' in text and ('风控' in text or '拒绝' in text):
+        return True
+
+    # 分块上传 500：上游偶发，重试通常能过（分块层自身已重试 3 次）
+    if '上传视频分块失败' in text:
+        return True
+
+    # 线路探测失败（历史版本会抛 'NoneType' object is not subscriptable）：
+    # 属环境/网络瞬时问题，换一轮通常可恢复。
+    if '上传线路' in text:
+        return True
+    if 'nonetype' in text and 'subscriptable' in text:
         return True
 
     network_markers = (
