@@ -186,12 +186,22 @@
         <div class="mt-2">
             {% if task.tags_generated %}
                 {% set tags = parse_json(task.tags_generated) %}
-                <div class="d-flex flex-wrap gap-1">
-                    {% for tag in tags[:3] %}
+                {# 卡片是全宽的，比表格里的标签列宽裕得多，先给 8 个 #}
+                {% set _visible = 8 %}
+                <div class="d-flex flex-wrap gap-1 align-items-start">
+                    {% for tag in tags[:_visible] %}
                         <span class="badge bg-secondary">{{ tag }}</span>
                     {% endfor %}
-                    {% if tags|length > 3 %}
-                        <span class="badge bg-light text-dark">+{{ tags|length - 3 }}</span>
+                    {% if tags|length > _visible %}
+                        {% set _rest = tags[_visible:] %}
+                        <details class="tag-more">
+                            <summary class="badge bg-light text-dark" title="还有 {{ _rest|length }} 个标签，点击展开">+{{ _rest|length }}</summary>
+                            <div class="tag-more-panel">
+                                {% for tag in _rest %}
+                                    <span class="badge bg-secondary me-1 mb-1">{{ tag }}</span>
+                                {% endfor %}
+                            </div>
+                        </details>
                     {% endif %}
                 </div>
             {% else %}
@@ -307,7 +317,23 @@
         </div>
 
         <div class="task-actions mt-3 d-grid gap-2 task-actions-grid-2">
-            {% if task.status in ('downloading', 'downloaded', 'asr_transcribing',
+            {# 已下载单独处理：素材在本地了，用户点进来就是要能手动投，给「上传」+「中止」 #}
+            {% if task.status == 'downloaded' %}
+                <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                    <button type="submit" class="btn btn-sm btn-success w-100"
+                            title="素材已下载完成，立即上传（缺少的元数据会自动补齐）">
+                        <i class="bi bi-cloud-upload me-1"></i> 上传
+                    </button>
+                </form>
+                <form method="post" action="{{ url_for('abandon_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                    <input type="hidden" name="delete_files" value="false">
+                    <input type="hidden" name="back" value="{{ request.full_path }}">
+                    <button type="submit" class="btn btn-sm btn-outline-secondary w-100"
+                            onclick="return confirm('确定中止该任务？')">
+                        <i class="bi bi-stop-circle me-1"></i> 中止
+                    </button>
+                </form>
+            {% elif task.status in ('downloading', 'asr_transcribing',
                                   'translating_subtitle', 'encoding_video', 'translating',
                                   'tagging', 'partitioning', 'moderating', 'uploading',
                                   'fetching_info', 'info_fetched') %}
@@ -323,9 +349,17 @@
                 <a href="{{ url_for('review_task', task_id=task.id) }}" class="btn btn-sm btn-warning"><i class="bi bi-eye me-1"></i> 审核</a>
             {% elif task.status == 'pending' %}
                 {% if task.retry_after %}
-                    <button type="button" class="btn btn-sm btn-outline-secondary w-100" disabled>
-                        <i class="bi bi-hourglass me-1"></i> 等待中
-                    </button>
+                    {# 冷却中默认会自动重试，但用户进来就是要手动操作，
+                       所以按钮可点，另用一行小字标注原定自动重试时间。 #}
+                    <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                        <button type="submit" class="btn btn-sm btn-success w-100"
+                                title="该任务原定 {{ task.retry_after }} 自动重试，点此立即上传">
+                            <i class="bi bi-cloud-upload me-1"></i> 立即上传
+                        </button>
+                    </form>
+                    <div class="small text-muted text-center" style="grid-column: 1 / -1;">
+                        <i class="bi bi-hourglass-split me-1"></i>{{ task.retry_after[11:16] }} 将自动重试
+                    </div>
                 {% else %}
                     <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
                         <button type="submit" class="btn btn-sm btn-primary w-100"><i class="bi bi-play-fill me-1"></i> 开始</button>
