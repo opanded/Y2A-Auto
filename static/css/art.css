@@ -196,6 +196,18 @@ header .navbar {
     box-shadow: 0 1px 0 rgba(255, 255, 255, .25) inset, 0 8px 18px -10px rgba(13, 110, 253, .6);
 }
 
+/* 队列图标（待审核/等待处理/准备上传/失败总数）底色是浅蓝 #eef4ff，
+   深色下会变成一块块刺眼的白方块，和整体质感不搭。
+   改成品牌色半透明底 + 细环 + 柔光，与 KPI 图标同一套语言。 */
+[data-theme="dark"] .queue-stat-icon {
+    background-color: rgba(77, 143, 253, .14);
+    color: #79c0ff;
+    box-shadow:
+        inset 0 0 0 1px rgba(120, 150, 220, .22),
+        inset 0 1px 0 rgba(255, 255, 255, .06),
+        0 6px 16px -10px rgba(77, 143, 253, .55);
+}
+
 .home-kpi-icon::after {
     content: "";
     position: absolute;

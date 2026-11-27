@@ -37,7 +37,13 @@
     /* --- 覆盖 Bootstrap 变量，让内置组件自动跟随 --- */
     --bs-body-bg: #0f1115;
     --bs-body-color: #e4e7ec;
+    /* Bootstrap 5.1 的文字工具类走的是 -rgb 变体（.text-body 用的是
+       rgba(var(--bs-body-color-rgb))），只改 --bs-body-color 不够——
+       .text-body 会继续用浅色主题的 33,37,41，在深色卡片上就是黑字。
+       任务卡标题正是 .text-body，这里必须补上 rgb 版本。 */
+    --bs-body-color-rgb: 228, 231, 236;
     --bs-emphasis-color: #ffffff;
+    --bs-emphasis-color-rgb: 255, 255, 255;
     --bs-secondary-color: #98a2b3;
     --bs-secondary-bg: #181b21;
     --bs-tertiary-bg: #1f232b;
@@ -229,6 +235,14 @@
     color: var(--y2a-text);
 }
 
+/* .text-muted 在 Bootstrap 5.1 里是写死的 #6c757d，
+   压到深色卡片上只有 3.68:1（低于 AA 4.5:1），任务卡副标题、
+   监控页「已处理 N 个视频」这类次要文字都靠它。
+   Bootstrap 自己的声明带 !important，所以这里也必须带上。 */
+[data-theme="dark"] .text-muted {
+    color: var(--y2a-text-muted) !important;
+}
+
 [data-theme="dark"] .card-header,
 [data-theme="dark"] .card-footer,
 [data-theme="dark"] .modal-header,
@@ -256,6 +270,17 @@
 [data-theme="dark"] .bg-light .text-primary,
 [data-theme="dark"] .card-header.bg-light .text-primary {
     color: var(--bs-link-color) !important;
+}
+
+/* .bg-light + .text-dark 在深色下会变成「暗底暗字」：
+   .bg-light 被压成 --y2a-bg-subtle，而 .text-dark 仍是 #212529。
+   这类组合在监控页/审核页用来标「任一匹配」「未生成标签」等中性状态，
+   深色下必须一起翻转，否则整块文字读不出来。
+   注意 .bg-warning/.bg-info 上的 .text-dark 是浅底深字，属正常，不要动。 */
+[data-theme="dark"] .bg-light.text-dark,
+[data-theme="dark"] .badge.bg-light.text-dark,
+[data-theme="dark"] .table-light .text-dark {
+    color: var(--y2a-text) !important;
 }
 
 /* 项目自绘的卡片（设置页 / 任务卡） */

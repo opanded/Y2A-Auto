@@ -276,10 +276,11 @@
     .history-table tbody tr {
         display: block;
         margin-bottom: 0.7rem;
-        border: 1px solid rgba(0,0,0,0.06);
+        border: 1px solid var(--y2a-border, rgba(0,0,0,0.06));
         border-radius: .35rem;
         padding: .35rem;
-        background: rgba(255,255,255,0.98);
+        /* 用变量而不是写死白色：深色主题下白色卡片配浅色文字＝白底白字 */
+        background: var(--y2a-bg-elevated, rgba(255,255,255,0.98));
     }
     /* Stack label above value for each cell to reduce horizontal clutter */
     .youtube-monitor-table tbody td,
@@ -293,7 +294,8 @@
         content: attr(data-label);
         display: block;
         font-weight: 700;
-        color: #222;
+        /* 用变量而不是写死 #222：深色主题下硬编码深灰会变成暗底暗字 */
+        color: var(--y2a-text, #222);
         margin-bottom: .25rem;
         font-size: .92rem;
     }
