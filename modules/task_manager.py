@@ -851,31 +851,22 @@ def _compute_next_daily_reset(hour: int = 0, minute: int = 30) -> str:
 def _daily_quota_retry_after(attempts: int, config=None) -> tuple:
     """日配额耗尽后该排到什么时候：返回 (retry_after, 说明文案, 等待秒数)。
 
-    默认假设配额按自然日 00:30 重置，先排到那个点。但实测 2026-11-28 00:30
-    仍然返回 137022——说明重置不在 00:00，或者账号走的是滚动窗口。
-    若此刻距下一个重置点超过 20 小时，等于刚刚就在重置点上失败，
-    再顺延过去会让任务整日空转（实测被推到 11-29）。此时改用递增探测：
-    4h → 8h → 16h，让任务当天仍有机会投出去。
+    实测结论（2026-11-27/28）：11-27 投出 51 条后开始 137022；
+    11-28 00:30（原本假设的「自然日重置点」）仍然 137022，02:30、02:53、
+    03:02、04:45 也全部被拒 —— 说明配额既不在 00:00 也不在 00:30 重置，
+    「按自然日顺延到重置点」这个假设是错的。
+
+    旧的实现会在此刻把任务顺延到次日 00:30，也就是让用户盯着
+    「1182 分钟后重试」等 19.5 小时，而那个时间点本身没有任何依据。
+    现在改为纯探测：4h → 8h → 16h 封顶，到点再试一次。
     """
     cfg = config or {}
-    hour = _as_int(cfg.get('DAILY_UPLOAD_RETRY_HOUR', 0), 0, minimum=0)
-    minute = _as_int(cfg.get('DAILY_UPLOAD_RETRY_MINUTE', 30), 30, minimum=0)
-    next_reset = _compute_next_daily_reset(hour, minute)
-
-    now = datetime.now()
-    hours_to_reset = (
-        datetime.strptime(next_reset, '%Y-%m-%d %H:%M:%S') - now
-    ).total_seconds() / 3600
-
-    if hours_to_reset > 20:
-        probe_hours = min(16, 4 * (2 ** min(2, max(0, attempts))))
-        return (
-            _compute_retry_after(probe_hours * 60),
-            f"日投稿配额耗尽（重置点仍被拒），{probe_hours} 小时后探测",
-            probe_hours * 3600,
-        )
-    wait_seconds = int((datetime.strptime(next_reset, '%Y-%m-%d %H:%M:%S') - now).total_seconds())
-    return next_reset, "日投稿配额已用尽，已顺延至重置点继续", wait_seconds
+    probe_hours = min(16, 4 * (2 ** min(2, max(0, attempts))))
+    return (
+        _compute_retry_after(probe_hours * 60),
+        f"日投稿配额耗尽，{probe_hours} 小时后重试",
+        probe_hours * 3600,
+    )
 
 
 def _is_retry_after_reached(retry_after) -> bool:
@@ -9935,8 +9926,14 @@ class TaskProcessor:
 
         return get_task(task_id)
     
-    def _upload_to_target(self, task_id, task_logger, allow_missing_translations=False):
-        """按任务平台分发上传实现。"""
+    def _upload_to_target(self, task_id, task_logger, allow_missing_translations=False,
+                          manual=False):
+        """按任务平台分发上传实现。
+
+        manual=True 表示用户在界面上手动点「上传/立即上传」：
+        跳过节流闸门（那是给自动流程防撞墙用的），但上传锁仍保留——
+        否则并发写入会打架。
+        """
         task = get_task(task_id)
         if not task:
             task_logger.error("任务不存在")
@@ -9984,7 +9981,8 @@ class TaskProcessor:
                 self._upload_to_bilibili(
                     task_id,
                     task_logger,
-                    subtitle_prepared=subtitle_prepared_in_this_round
+                    subtitle_prepared=subtitle_prepared_in_this_round,
+                    manual=manual,
                 )
             else:
                 task_logger.info("检测到已有 bilibili 上传结果，跳过 bilibili 上传")
@@ -9992,7 +9990,7 @@ class TaskProcessor:
 
         if upload_target == UPLOAD_TARGET_BILIBILI:
             if UPLOAD_TARGET_BILIBILI in pending_platforms:
-                self._upload_to_bilibili(task_id, task_logger)
+                self._upload_to_bilibili(task_id, task_logger, manual=manual)
             else:
                 task_logger.info("检测到已有 bilibili 上传结果，跳过 bilibili 上传")
             return
@@ -10076,7 +10074,7 @@ class TaskProcessor:
 
         return get_task(task_id) or task
 
-    def _upload_to_bilibili(self, task_id, task_logger, subtitle_prepared=False):
+    def _upload_to_bilibili(self, task_id, task_logger, subtitle_prepared=False, manual=False):
         """上传到 Bilibili - 带并发控制"""
         task = get_task(task_id)
         if not task:
@@ -10101,13 +10099,20 @@ class TaskProcessor:
                 # 上传锁只保证串行，不能阻止「一条接一条」连发触发平台风控。
                 # 非阻塞：不满足节奏就把任务放回队列并设置 retry_after，
                 # 立即释放线程，避免 sleep 吃满 APScheduler 线程池。
-                allowed, wait_s = wait_for_upload_slot(self.config, task_logger)
-                if not allowed:
-                    if wait_s > 0:
-                        self._defer_task_for_pace(task_id, wait_s, task_logger)
-                    else:
-                        task_logger.info("上传节流检查被取消，放弃本次上传")
-                    return
+                #
+                # 手动上传跳过节流：节流是给自动流程防撞墙用的，用户点按钮
+                # 就是明确要求「现在就试一次」。此前手动上传也被 19 小时的
+                # 静默窗口挡住，按钮点了等于没反应。
+                if manual:
+                    task_logger.info("手动上传：跳过节流闸门，直接尝试")
+                else:
+                    allowed, wait_s = wait_for_upload_slot(self.config, task_logger)
+                    if not allowed:
+                        if wait_s > 0:
+                            self._defer_task_for_pace(task_id, wait_s, task_logger)
+                        else:
+                            task_logger.info("上传节流检查被取消，放弃本次上传")
+                        return
                 self._do_upload_to_bilibili(task_id, task_logger, subtitle_prepared=subtitle_prepared)
                 task_logger.info("释放上传锁")
         except Exception as e:
@@ -10921,8 +10926,10 @@ def force_upload_task(task_id, config=None):
     task_logger = setup_task_logger(task_id)
     
     try:
-        # 直接执行上传步骤
-        processor._upload_to_target(task_id, task_logger, allow_missing_translations=True)
+        # 直接执行上传步骤。manual=True：用户手动点的，跳过节流闸门。
+        processor._upload_to_target(
+            task_id, task_logger, allow_missing_translations=True, manual=True,
+        )
 
         # 上传流程（强制路径）不会进入 process_task 的 finally，需手动唤醒队列
         try:

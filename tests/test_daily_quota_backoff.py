@@ -1,19 +1,17 @@
-"""日配额耗尽后的退避策略：不要让任务整日空转。
+"""日配额耗尽后的退避策略：纯探测，不再假设「次日重置点」。
 
 背景（2026-11-27/28 实测）：
   - 11-27 当天投出 51 条，第 52 次起持续返回 137022。
-  - 任务被顺延到 11-28 00:30（「次日重置点」），结果仍然 137022。
-    说明配额不是按自然日 00:00 清零，或账号走滚动窗口。
-  - 旧逻辑此时会再顺延到 11-29 00:30，等于跳过一整天。
+  - 11-28 00:30（原本假设的「自然日重置点」）仍然 137022；
+    02:30、02:53、03:02、04:45 也全部被拒。
+    → 说明配额既不在 00:00 也不在 00:30 重置，「顺延到重置点」这个假设是错的。
 
-因此：
-  - 距离下一个重置点 >20h（说明刚在重置点上失败）→ 改用递增探测 4h / 8h / 16h；
-  - 否则按重置点顺延；
-  - 日配额耗尽不放大节流惩罚倍数，只压静默窗口，让整条队列一起等，
-    而不是逐条去撞同一堵墙。
+旧实现因此在凌晨把任务排到「次日 00:30」，界面上显示
+「1182 分钟后重试」——让用户白等 19.5 小时，而那个时点毫无依据。
 
-注意：这些断言必须用「可控时钟」，否则会随一天中的时刻翻转
-（例如 04:33 时距下一个 00:30 只有 19.9h，就走不到探测分支）。
+现在改为纯递增探测：4h → 8h → 16h（封顶），到点再试一次。
+
+注意：断言用「可控时钟」，否则会随一天中的时刻翻转。
 """
 
 import ast
@@ -64,84 +62,81 @@ def _load_functions(*names):
     return [ns[n] for n in names]
 
 
-class DailyQuotaBackoffTests(unittest.TestCase):
-    """固定时刻：凌晨 00:40（刚过 00:30 重置点）。"""
+class DailyQuotaProbeBackoffTests(unittest.TestCase):
+    """固定时刻：凌晨 04:58（旧实现会把任务推到次日 00:30 = 等 19.5 小时）。"""
 
     def setUp(self):
-        _FrozenDatetime.set_now(datetime(2026, 11, 28, 0, 40, 0))
-        self.retry_after, self.next_reset, self.compute_retry = _load_functions(
-            "_daily_quota_retry_after", "_compute_next_daily_reset", "_compute_retry_after")
+        _FrozenDatetime.set_now(datetime(2026, 11, 28, 4, 58, 0))
+        self.retry_after, self.compute_retry = _load_functions(
+            "_daily_quota_retry_after", "_compute_retry_after")
 
     def _hours_until(self, value):
         return (
             datetime.strptime(value, "%Y-%m-%d %H:%M:%S") - _FrozenDatetime.now()
         ).total_seconds() / 3600
 
-    def test_just_after_reset_uses_increasing_probe(self):
-        """刚在重置点上失败时改递增探测，而不是再顺延一整天。"""
-        waits = []
-        for attempts in (0, 1, 2):
-            retry_after, note, wait_s = self.retry_after(attempts, {})
-            hours = self._hours_until(retry_after)
-            self.assertLess(hours, 20, f"attempts={attempts} 不该顺延到次日")
-            self.assertIn("探测", note)
-            waits.append(wait_s)
-        # 4h → 8h → 16h
-        self.assertEqual(waits, [4 * 3600, 8 * 3600, 16 * 3600])
+    def test_first_probe_is_four_hours(self):
+        retry_after, note, wait_s = self.retry_after(0, {})
+        self.assertEqual(wait_s, 4 * 3600)
+        self.assertAlmostEqual(self._hours_until(retry_after), 4.0, delta=0.1)
+        self.assertIn("4 小时", note)
 
-    def test_probe_backoff_capped(self):
-        _, _, wait_s = self.retry_after(9, {})
-        self.assertEqual(wait_s, 16 * 3600, "递增探测应封顶 16 小时")
+    def test_never_waits_until_next_midnight(self):
+        """回归：凌晨时不能把任务推到次日 00:30（那是 19.5 小时）。"""
+        for attempts in (0, 1, 2, 3, 9):
+            retry_after, _, wait_s = self.retry_after(attempts, {})
+            self.assertLessEqual(wait_s, 16 * 3600,
+                                 f'attempts={attempts} 等待过长（旧实现在这里有 19.5h）')
+            self.assertLessEqual(self._hours_until(retry_after), 16.1)
+
+    def test_backoff_grows_then_caps(self):
+        waits = [self.retry_after(a, {})[2] for a in (0, 1, 2, 3)]
+        self.assertEqual(waits, [4 * 3600, 8 * 3600, 16 * 3600, 16 * 3600])
 
     def test_wait_seconds_matches_timestamp(self):
         for attempts in (0, 1, 2):
             retry_after, _, wait_s = self.retry_after(attempts, {})
-            hours = self._hours_until(retry_after)
-            self.assertAlmostEqual(hours * 3600, wait_s, delta=120)
+            self.assertAlmostEqual(self._hours_until(retry_after) * 3600, wait_s, delta=120)
+
+    def test_note_mentions_hours(self):
+        _, note, _ = self.retry_after(1, {})
+        self.assertIn("8 小时", note)
 
 
-class DailyQuotaDefersToResetTests(unittest.TestCase):
-    """固定时刻：下午 15:00（距下一个 00:30 还有 9.5h，属正常顺延）。"""
+class ManualUploadBypassesPaceTests(unittest.TestCase):
+    """手动上传必须跳过节流闸门。
 
-    def setUp(self):
-        _FrozenDatetime.set_now(datetime(2026, 11, 28, 15, 0, 0))
-        self.retry_after, self.next_reset, self.compute_retry = _load_functions(
-            "_daily_quota_retry_after", "_compute_next_daily_reset", "_compute_retry_after")
-
-    def test_midday_defers_to_next_reset(self):
-        retry_after, note, wait_s = self.retry_after(0, {})
-        self.assertEqual(retry_after, "2026-11-29 00:30:00")
-        self.assertIn("顺延", note)
-        # 15:00 -> 次日 00:30 = 9.5h
-        self.assertEqual(wait_s, int(9.5 * 3600))
-
-    def test_wait_seconds_positive(self):
-        _, _, wait_s = self.retry_after(3, {})
-        self.assertGreater(wait_s, 0)
-
-
-class RateLimitPacePenaltyTests(unittest.TestCase):
-    """日配额耗尽不应放大节流倍数（会拖累次日第一批任务）。"""
+    节流是给自动流程防撞墙用的；用户点「立即上传」就是明确要求现在试一次。
+    此前手动上传同样被 19 小时的静默窗口挡住，按钮点了等于没反应。
+    """
 
     def setUp(self):
         self.source = MODULE.read_text(encoding="utf-8")
 
-    def test_daily_quota_does_not_escalate_factor(self):
-        idx = self.source.index("def note_upload_rate_limited")
-        body = self.source[idx:idx + 2200]
-        daily_idx = body.index("if daily_quota:")
-        factor_idx = body.index("_upload_penalty_factor = min(8")
-        self.assertLess(daily_idx, factor_idx,
-                        "daily_quota 分支必须先返回，不再放大惩罚倍数")
-        self.assertIn("return", body[daily_idx:factor_idx])
+    def test_upload_to_bilibili_accepts_manual_flag(self):
+        self.assertIn(
+            "def _upload_to_bilibili(self, task_id, task_logger, "
+            "subtitle_prepared=False, manual=False)",
+            self.source,
+        )
 
-    def test_daily_quota_still_sets_silence_window(self):
-        """静默窗口必须保留，否则队列会逐条撞墙。"""
-        idx = self.source.index("def note_upload_rate_limited")
-        body = self.source[idx:idx + 2200]
-        daily_idx = body.index("if daily_quota:")
-        factor_idx = body.index("_upload_penalty_factor = min(8")
-        self.assertIn("_upload_penalty_until", body[daily_idx:factor_idx])
+    def test_manual_skips_pace_gate(self):
+        idx = self.source.index("if manual:")
+        window = self.source[idx:idx + 700]
+        self.assertIn("跳过节流闸门", window)
+        # manual 分支必须直接落到上传，不经过 wait_for_upload_slot
+        self.assertIn("_do_upload_to_bilibili", window)
+
+    def test_force_upload_passes_manual(self):
+        idx = self.source.index("def force_upload_task")
+        body = self.source[idx:idx + 3000]
+        self.assertIn("manual=True", body)
+
+    def test_manual_flag_threaded_through_target(self):
+        self.assertIn("def _upload_to_target(self, task_id, task_logger, "
+                      "allow_missing_translations=False,", self.source)
+        self.assertIn("self._upload_to_bilibili(task_id, task_logger, manual=manual)",
+                      self.source)
 
 
 if __name__ == "__main__":
