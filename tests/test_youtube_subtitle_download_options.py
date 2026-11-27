@@ -43,7 +43,13 @@ class YouTubeSubtitleDownloadOptionsTests(unittest.TestCase):
         )
 
         self.assertIn("--write-auto-subs", args)
-        self.assertEqual(args[:-1], ["--write-subs", "--all-subs", "--convert-subs", "srt"])
+        # 不再用 --all-subs：那会一次抓 28~31 种字幕语言，改用 --sub-langs 限定语言
+        self.assertNotIn("--all-subs", args)
+        self.assertIn("--sub-langs", args)
+        self.assertEqual(
+            args[:4],
+            ["--write-subs", "--convert-subs", "srt", "--write-auto-subs"],
+        )
 
 
 class YouTubeJsRuntimeOptionsTests(unittest.TestCase):

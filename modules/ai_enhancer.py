@@ -330,6 +330,88 @@ _DESCRIPTION_ONLY_RETRY_REASONS = frozenset({"empty_output", "description_not_na
 METADATA_TRANSLATION_MAX_ATTEMPTS = 3
 METADATA_TRANSLATION_RETRY_DELAY_SECONDS = 2
 
+# ---------------------------------------------------------------------------
+# 译文规范化（确定性，不依赖模型自觉）
+# ---------------------------------------------------------------------------
+# 术语表只约束「原文命中时该用什么译名」，管不住模型对同一概念的多种写法。
+# 实测同一频道会产出「手机游戏/手游」「角色CM/分角色CM/角色别CM/按角色划分版本CM」
+# 「环彩羽/环伊吕波」并存，观众看到同一角色两种名字就以为标题张冠李戴。
+# 这里在模型输出之后按配置做一次归一，保证同系列视频的译名与格式逐字一致。
+
+
+def _load_json_mapping(raw: Any) -> Dict[str, str]:
+    """把配置里的 JSON 对象安全解析成 str→str 映射。"""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k).strip(): str(v).strip()
+        for k, v in data.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+
+# 默认替换表：键是「模型可能写出的形式」，值是「统一写法」。
+# 长键优先匹配（见 _normalize_translated_metadata），避免短键把长键切碎。
+_DEFAULT_METADATA_TERM_NORMALIZE = {
+    # 角色名：環いろは 官方简体译名为「环彩羽」，「环伊吕波」仅为别称
+    "环伊吕波": "环彩羽",
+    "環伊呂波": "环彩羽",
+    "伊吕波": "彩羽",
+    "塔尔托": "环彩羽",
+    "塔露特": "环彩羽",
+    # 角色 CM 标签：同一系列此前出现四种写法
+    "按角色划分版本CM": "角色CM",
+    "角色别ver. CM": "角色CM",
+    "角色别ver.CM": "角色CM",
+    "角色别CM": "角色CM",
+    "分角色CM": "角色CM",
+    # 平台前缀
+    "手机游戏": "手游",
+    "电视动画": "TV动画",
+    # 固定术语
+    "预告宣传视频": "预告PV",
+}
+
+
+def _load_metadata_normalization(openai_config=None) -> Dict[str, str]:
+    """读取译文规范化替换表（别名/异形写法 → 统一写法）。
+
+    配置缺失时回退到内置默认，保证开箱即用。
+    """
+    cfg = openai_config or {}
+    raw = cfg.get('METADATA_TERM_NORMALIZE')
+    if raw is None:
+        try:
+            from modules.config_manager import load_config
+            raw = (load_config() or {}).get('METADATA_TERM_NORMALIZE')
+        except Exception:
+            raw = None
+    mapping = _load_json_mapping(raw)
+    return mapping or dict(_DEFAULT_METADATA_TERM_NORMALIZE)
+
+
+def _normalize_translated_metadata(text: str, mapping: Optional[Dict[str, str]] = None) -> str:
+    """把模型输出里的同义异形写法归一。
+
+    只做确定性替换，不增删事实，不改动其他内容。
+    """
+    result = safe_str(text)
+    if not result:
+        return result
+    table = mapping if mapping else _DEFAULT_METADATA_TERM_NORMALIZE
+    # 长键优先，避免短键抢先命中
+    for src in sorted(table, key=len, reverse=True):
+        dst = table[src]
+        if src != dst:
+            result = result.replace(src, dst)
+    return re.sub(r"[ \t]{2,}", " ", result).strip()
+
 
 def _normalize_target_language(target_language: str) -> str:
     value = safe_str(target_language).strip().lower()
@@ -520,6 +602,25 @@ def _build_fallback_text(
     )
 
 
+def _load_glossary(openai_config=None) -> dict:
+    """读取术语表配置（JSON 对象：原文 → 固定译名）。"""
+    cfg = openai_config or {}
+    raw = cfg.get('METADATA_GLOSSARY')
+    if not raw:
+        try:
+            from modules.config_manager import load_config
+            raw = (load_config() or {}).get('METADATA_GLOSSARY')
+        except Exception:
+            raw = None
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _build_metadata_translation_system_prompt(target_language: str, retry: bool = False, openai_config=None) -> str:
     """构建元数据翻译 system prompt（委托给统一 Prompt 中心）。"""
     from .prompt_manager import get_metadata_translate_prompt, read_prompt_config_from_app_config
@@ -535,6 +636,7 @@ def _build_metadata_translation_system_prompt(target_language: str, retry: bool 
         user_text=user_text,
         target_language=target_language,
         retry=retry,
+        glossary=_load_glossary(openai_config),
     )
 
 
@@ -1127,6 +1229,7 @@ def translate_video_metadata(
 
         start_time = time.time()
         last_attempt_result = None
+        normalization_table = _load_metadata_normalization(openai_config)
 
         for attempt in range(1, METADATA_TRANSLATION_MAX_ATTEMPTS + 1):
             final_result["attempts"] = attempt
@@ -1161,6 +1264,20 @@ def translate_video_metadata(
             last_attempt_result = attempt_result
             translated_fields = dict(attempt_result.get("translated_fields") or {})
             failed_fields = dict(attempt_result.get("failed_fields") or {})
+
+            # 译名/格式归一：不依赖模型自觉，保证同系列视频用词逐字一致
+            normalization = normalization_table or _DEFAULT_METADATA_TERM_NORMALIZE
+            for field_name in ("title", "description"):
+                original_value = safe_str(translated_fields.get(field_name) or '')
+                if not original_value:
+                    continue
+                normalized_value = _normalize_translated_metadata(original_value, normalization)
+                if normalized_value != original_value:
+                    logger.info(
+                        "译文规范化(%s)已应用: %s → %s",
+                        field_name, original_value[:60], normalized_value[:60],
+                    )
+                    translated_fields[field_name] = normalized_value
 
             final_result["translated_fields"] = {
                 "title": translated_fields.get("title", ""),

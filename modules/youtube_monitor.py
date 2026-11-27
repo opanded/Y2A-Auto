@@ -117,6 +117,10 @@ MONITOR_CONFIG_FIELD_DEFAULTS: Dict[str, Any] = {
     'auto_add_to_tasks': False,
     'historical_progress_date': '',
     'historical_offset': 0,
+    # 历史/轮询模式单次最多检查的视频数。0 表示不限制（会翻完整个上传列表）。
+    # 轮询场景下必须设上限：Aniplex 这类频道有 1.7 万条视频，翻全量要 2 分钟以上，
+    # 12 个配置串行根本跑不进 15 分钟窗口。
+    'historical_max_videos': 0,
     'video_types': 'video,short,live',
 }
 
@@ -279,6 +283,13 @@ class YouTubeMonitor:
                 cursor.execute("ALTER TABLE monitor_configs ADD COLUMN historical_offset INTEGER DEFAULT 0")
             except sqlite3.OperationalError:
                 pass
+
+            # 单轮最多检查的视频数（0=不限制）。轮询场景需要限页，
+            # 否则大频道翻全量会把一轮拖到 40 分钟以上。
+            try:
+                cursor.execute("ALTER TABLE monitor_configs ADD COLUMN historical_max_videos INTEGER DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
             
             # 监控历史表
             cursor.execute('''
@@ -408,20 +419,16 @@ class YouTubeMonitor:
         """重新启动已恢复配置的自动调度"""
         try:
             configs = self.get_monitor_configs()
-            restored_schedules = 0
-            
-            for config in configs:
-                if config['enabled'] and config['schedule_type'] == 'auto':
-                    self._schedule_monitor(config['id'], self._resolve_schedule_interval_minutes(config))
-                    restored_schedules += 1
-            
-            if restored_schedules > 0:
-                logger.info(f"重新启动了 {restored_schedules} 个自动调度任务")
-                
-                # 启动调度器
-                if not self.scheduler.running:
-                    self.scheduler.start()
-                    
+            auto_configs = [
+                c for c in configs
+                if c['enabled'] and c['schedule_type'] == 'auto'
+            ]
+
+            if auto_configs:
+                # 单一定时作业模型：一次重排即可覆盖全部配置
+                self.start_all_schedules(immediate=False)
+                logger.info(f"已重启轮询作业，覆盖 {len(auto_configs)} 个自动调度配置")
+
         except Exception as e:
             logger.error(f"重新启动调度任务失败: {str(e)}")
     
@@ -908,6 +915,23 @@ class YouTubeMonitor:
             raise
     
     def run_monitor(self, config_id: int) -> Tuple[bool, str]:
+        """执行监控任务（串行化：同一时刻只跑一个配置）。"""
+        # 串行锁：拿不到就让出本轮，等下个调度周期。
+        # 用带超时的 acquire 而不是永久阻塞，避免某个配置卡死时
+        # 把后续所有配置也堵住。
+        acquired = self._MONITOR_RUN_LOCK.acquire(timeout=self._MONITOR_LOCK_WAIT_SECONDS)
+        if not acquired:
+            logger.info(
+                "配置 %s 跳过本轮：另一个监控正在执行（串行模式，避免并发请求打爆代理）",
+                config_id,
+            )
+            return True, "跳过：已有监控在执行"
+        try:
+            return self._run_monitor_locked(config_id)
+        finally:
+            self._MONITOR_RUN_LOCK.release()
+
+    def _run_monitor_locked(self, config_id: int) -> Tuple[bool, str]:
         """执行监控任务"""
         logger.info(f"开始执行监控任务，配置ID: {config_id}")
         
@@ -990,9 +1014,19 @@ class YouTubeMonitor:
                     logger.info("今日剩余入队额度 %d 条，本轮上限收紧到该值", daily_cap)
                     max_add_to_tasks = daily_cap
 
+            # 一次性批量查出本页所有候选里哪些没处理过，避免逐条 SQL。
+            unseen_ids = self._filter_unseen_ids(
+                [v['id'] for v in filtered_videos], config_id
+            )
+            if filtered_videos:
+                logger.info(
+                    "候选 %d 条中，本地库未处理过的 %d 条",
+                    len(filtered_videos), len(unseen_ids),
+                )
+
             for video in filtered_videos:
-                # 先去重：已处理过的直接跳过，不参与本轮统计
-                if self._is_video_processed(video['id'], config_id):
+                # 跳过已处理过的（批量查过，命中集合即可）
+                if video['id'] not in unseen_ids:
                     logger.debug(f"视频已处理过，跳过: {video['title']}")
                     continue
 
@@ -1099,6 +1133,26 @@ class YouTubeMonitor:
                     days = max(config.get('time_period', 7), 1)
                     logger.info(f"使用时间段: 最近 {days} 天（time_period 配置）")
                     published_after = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+                # 增量游标：只要该配置成功跑过一轮（有 last_run_time），
+                # 后续就只拉「上次运行之后」的内容。这比按 time_period 回翻
+                # 高效得多——3650 天窗口意味着每次都要翻几千条播放列表。
+                # 首轮仍用完整时间窗把所有历史抓一遍，之后自动转为增量。
+                last_run_str = config.get('last_run_time')
+                if last_run_str:
+                    try:
+                        last_run_dt = datetime.strptime(str(last_run_str)[:19], '%Y-%m-%d %H:%M:%S')
+                        # 回退 10 分钟，容忍同一时刻跨页发布
+                        last_run_dt = last_run_dt - timedelta(minutes=10)
+                        cursor = last_run_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                        if not published_after or cursor > published_after:
+                            logger.info(
+                                "增量模式：沿用上次运行时间 %s 作为起点（不再回翻全量）",
+                                cursor,
+                            )
+                            published_after = cursor
+                    except (ValueError, TypeError):
+                        logger.debug("last_run_time 解析失败，沿用时间窗: %s", last_run_str)
             
             # 如果指定了频道，优先使用频道搜索
             if config.get('channel_ids') and config['channel_ids'].strip():
@@ -1910,6 +1964,76 @@ class YouTubeMonitor:
         
         return hours * 3600 + minutes * 60 + seconds
     
+    def _channel_seen_watermark(self, config_id: int, channel_id: str) -> Optional[str]:
+        """用本地库算出该频道的「已处理水位线」= 已记录视频中最新的发布时间。
+
+        有了它就不必每次都从「N 年前」开始翻全量：频道播放列表按发布时间倒序，
+        水位线之后的内容才有可能是新的。返回 None 表示本地没有该频道的记录，
+        需要从配置的时间窗口起点开始。
+
+        重要：本地记录可能不完整（例如配置改过关键词、或历史抓取中途失败）。
+        如果水位线比「最近 N 天」还旧，说明本地库并没有真正覆盖近期内容，
+        此时用水位线会让翻页量不减反增，必须退回时间窗。
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT MAX(published_at) FROM monitor_history "
+                    "WHERE config_id = ? AND published_at IS NOT NULL AND published_at != ''",
+                    (config_id,),
+                ).fetchone()
+            newest = (row[0] or '').strip() if row else ''
+            if not newest:
+                return None
+            try:
+                dt = datetime.strptime(newest[:19].replace('Z', ''), '%Y-%m-%dT%H:%M:%S')
+            except ValueError:
+                return None
+
+            # 水位线过旧（超过 30 天）说明本地库没覆盖近期内容，不可信
+            age_days = (datetime.utcnow() - dt).days
+            if age_days > 30:
+                logger.info(
+                    "本地最新记录已是 %d 天前（%s），水位线不可信，改用时间窗",
+                    age_days, newest[:10],
+                )
+                return None
+
+            # 回退一小段：同一时刻发布的视频可能跨页，留缓冲避免漏抓
+            dt = dt - timedelta(minutes=10)
+            return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        except Exception as exc:
+            logger.debug("计算频道水位线失败: %s", exc)
+            return None
+
+    def _filter_unseen_ids(self, video_ids, config_id: int) -> set:
+        """批量查本地库，返回「未处理过」的 video_id 集合。
+
+        一次 SQL 查完，避免逐条 _is_video_processed 造成 N 次查询。
+        """
+        if not video_ids:
+            return set()
+        ids = [v for v in video_ids if v]
+        if not ids:
+            return set()
+        seen = set()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # 分批查避免 SQLite 变量上限（默认 999）
+                for i in range(0, len(ids), 500):
+                    chunk = ids[i:i + 500]
+                    placeholders = ','.join(['?'] * len(chunk))
+                    rows = conn.execute(
+                        f"SELECT video_id FROM monitor_history "
+                        f"WHERE config_id = ? AND video_id IN ({placeholders})",
+                        [config_id] + chunk,
+                    ).fetchall()
+                    seen.update(r[0] for r in rows)
+        except Exception as exc:
+            logger.warning("批量查询已处理视频失败: %s", exc)
+            return set(ids)
+        return set(ids) - seen
+
     def _is_video_processed(self, video_id, config_id):
         """检查视频是否已经处理过"""
         with sqlite3.connect(self.db_path) as conn:
@@ -2150,6 +2274,14 @@ class YouTubeMonitor:
     # 官方配额按太平洋时间（America/Los_Angeles）0 点重置，见
     # https://developers.google.com/youtube/v3/determine_quota_cost
     _MONITOR_DAILY_SEARCH_LIMIT = 100
+
+    # 全局串行锁：同一时刻只允许一个监控配置真正在跑。
+    # 多个配置同时翻页会集中发起大量频道请求，实测 11 个齐发时大量 TLS
+    # 握手被打断（SSL: WRONG_VERSION_NUMBER），整轮监控失败。
+    # 用非阻塞获取 + 短等待：拿不到锁就本轮跳过，下个周期自然会再轮到，
+    # 不会堆积线程。
+    _MONITOR_RUN_LOCK = threading.Lock()
+    _MONITOR_LOCK_WAIT_SECONDS = 90
     # 保留 5% 余量，兼容同一项目中不经过本进程的少量搜索调用。
     _MONITOR_DAILY_SEARCH_BUDGET = int(_MONITOR_DAILY_SEARCH_LIMIT * 0.95)  # 95 次/天
     # 所有实际运行的手动配置共用一个配额槽。SQLite 自增配置 ID 为正数，
@@ -2415,17 +2547,23 @@ class YouTubeMonitor:
             return 25
 
     def _remaining_daily_enqueue_budget(self) -> int:
-        """今日剩余的入队额度。上限为 0 时返回一个足够大的数表示不限。"""
+        """今日剩余的入队额度。上限为 0 时返回一个足够大的数表示不限。
+
+        注意时区：monitor_history.run_time 来自 SQLite 的 datetime('now')，是
+        **UTC**；而这里如果用本地日期去比对，在 UTC+8 的凌晨 0-8 点会落到前一天，
+        导致「今日已用」永远查成 0，闸门形同虚设（实测一次放进了 57 条）。
+        因此按 UTC 日期统计，并要求 run_time 也是 UTC 口径。
+        """
         cap = self._daily_enqueue_cap()
         if cap <= 0:
             return 10 ** 6
         try:
-            today = datetime.now().strftime('%Y-%m-%d')
+            today_utc = datetime.utcnow().strftime('%Y-%m-%d')
             with sqlite3.connect(self.db_path) as conn:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM monitor_history "
                     "WHERE added_to_tasks = 1 AND substr(run_time, 1, 10) = ?",
-                    (today,),
+                    (today_utc,),
                 ).fetchone()
             used = row[0] if row else 0
         except Exception as exc:
@@ -2434,59 +2572,56 @@ class YouTubeMonitor:
         return max(0, cap - used)
 
     def _schedule_monitor(self, config_id, interval_minutes):
-        """添加监控任务到调度器。
+        """确保「轮询作业」存在（不再为单个配置挂独立定时器）。
 
-        同一间隔的多个配置会同时到点，集中发起大量频道请求；实测 11 个配置
-        齐发时大量 TLS 握手被打断（SSL: WRONG_VERSION_NUMBER），整轮监控失败。
-        这里按配置 ID 错开首次触发时间，把并发摊平。
+        历史做法是每个配置一个 interval 作业，再靠错峰时间摊平并发。问题有两个：
+        同一间隔的多个配置仍可能撞在一起；撞上时拿不到串行锁的那个会被整轮跳过，
+        于是「N 分钟内所有配置都跑过一遍」无法保证。
+
+        现在统一为单一定时作业 monitor_cycle：它每 N 分钟触发一次，在一轮里
+        按顺序把每个启用的自动配置各跑一遍。本函数只负责「调用 start_all_schedules
+        确保该作业存在」，间隔取所有自动配置中的最小值，
+        这样任何单个配置的改动都会即时反映到统一周期上。
         """
-        job_id = f"monitor_{config_id}"
+        job_id = 'monitor_cycle'
 
         try:
             config = self.get_monitor_config(config_id)
             config_name = config['name'] if config else f"ID-{config_id}"
 
-            # 错峰：每个配置延迟 (序号 × 错峰间隔) 分钟，避免所有配置同一秒起跑
-            stagger_minutes = _as_int_monitor(config.get('schedule_stagger_minutes'), 0)
-            if stagger_minutes <= 0:
-                stagger_minutes = 1  # 默认每个配置错开 1 分钟
-            offset_minutes = (max(0, int(config_id)) % 60) * stagger_minutes
-            start_date = datetime.now() + timedelta(minutes=offset_minutes)
+            self.start_all_schedules(immediate=False)
 
-            self.scheduler.add_job(
-                func=self.run_monitor,
-                trigger='interval',
-                minutes=interval_minutes,
-                id=job_id,
-                args=[config_id],
-                replace_existing=True,
-                next_run_time=start_date,
-            )
-
-            if not self.scheduler.running:
-                self.scheduler.start()
-                logger.info("调度器已启动")
-
-            logger.info(
-                f"添加监控调度任务: {config_name} ({job_id}), 间隔: {interval_minutes}分钟"
-                f", 首次触发: {start_date.strftime('%H:%M')}"
-            )
+            job = self.scheduler.get_job(job_id)
+            if job:
+                logger.info(
+                    "配置 %s (%s) 已纳入轮询作业，当前周期: %s 分钟",
+                    config_name, config_id,
+                    getattr(job.trigger, 'interval', None),
+                )
+            else:
+                logger.info(
+                    "配置 %s (%s) 已保存，但当前没有启用的自动配置，轮询作业未创建",
+                    config_name, config_id,
+                )
         except Exception as e:
             logger.error(f"添加调度任务失败: {str(e)}")
     
     def _update_schedule(self, config_id, config_data):
-        """更新调度任务"""
-        job_id = f"monitor_{config_id}"
-        
-        # 移除现有任务
-        self._remove_schedule(config_id)
-        
-        # 如果是自动调度，重新添加（尊重用户配置的间隔，配额由共享每日预算兜底）
-        if config_data.get('schedule_type') == 'auto' and config_data.get('enabled'):
-            self._schedule_monitor(config_id, self._resolve_schedule_interval_minutes(config_data))
+        """更新调度：配置改动后重算统一轮询周期。
+
+        旧做法会先移除该配置的独立定时器再重建；现在只有一个轮询作业，
+        直接重排即可——启用集合或间隔变化都会由 start_all_schedules 反映。
+        """
+        self.start_all_schedules(immediate=False)
     
     def _remove_schedule(self, config_id):
-        """移除调度任务（含启动后立即检查任务）"""
+        """移除单个配置的调度痕迹。
+
+        单一定时作业模型下，没有「每配置一个定时器」可移除；
+        配置被禁用/删除后，run_monitor_cycle 会因为查不到启用配置而自然跳过它。
+        这里仍清理历史遗留的 monitor_<id> / monitor_immediate_<id> 作业，
+        保证从旧版本升级上来时不会残留重复抓取。
+        """
         job_id = f"monitor_{config_id}"
         immediate_id = f"monitor_immediate_{config_id}"
 
@@ -2494,7 +2629,7 @@ class YouTubeMonitor:
             try:
                 if self.scheduler.get_job(jid):
                     self.scheduler.remove_job(jid)
-                    logger.info(f"移除监控调度任务: {jid}")
+                    logger.info(f"移除遗留调度任务: {jid}")
             except Exception as e:
                 logger.error(f"移除调度任务失败: {jid}, 错误: {str(e)}")
     
@@ -2583,46 +2718,91 @@ class YouTubeMonitor:
             return False, f"清除历史记录失败: {str(e)}"
     
     def start_all_schedules(self, immediate=True):
-        """启动所有自动调度的监控任务。
+        """启动监控调度。
 
-        immediate=True 时，对「此前不存在对应定时任务」的配置额外安排一次 15s 后的立即检查；
-        对已有定时任务（例如设置保存触发的重启）不再重复安排，避免每次保存都触发一次立即运行
-        从而绕过每日配额预算。该立即检查同样走 _fetch_search_videos，会计入跨配置每日预算。
+        采用「单一定时作业 + 轮内遍历全部配置」的模型：
+        一个作业每 N 分钟触发一次，在同一个任务里按顺序把每个启用的自动配置
+        各跑一遍。这样「N 分钟内所有配置都过了一遍」是结构性保证，
+        而不是靠给每个配置各挂一个定时器去碰运气——那种做法在两个配置同时
+        到点时，拿不到串行锁的会被整轮跳过，实际做不到「都过一遍」。
+
+        所有配置共用同一个轮询间隔，取其中最小值（默认 15 分钟）。
         """
         logger.info("开始启动所有自动调度的监控任务")
-        
+
         configs = self.get_monitor_configs()
         auto_configs = [config for config in configs if config['enabled'] and config['schedule_type'] == 'auto']
-        
+
         logger.info(f"找到 {len(auto_configs)} 个启用的自动调度配置")
-        
-        for config in auto_configs:
-            # 尊重用户配置的调度间隔（而非强制每日），配额安全由共享每日预算兜底
-            job_existed = self.scheduler.get_job(f"monitor_{config['id']}") is not None
-            run_interval = self._resolve_schedule_interval_minutes(config)
-            logger.info(f"启动调度: {config['name']} (ID: {config['id']}), 间隔: {run_interval}分钟")
-            self._schedule_monitor(config['id'], run_interval)
-            # 仅当定时任务此前不存在时才安排「启动后立即检查」，避免每次保存都绕过每日预算
-            if immediate and not job_existed:
+
+        # 清掉旧的「每配置一个定时器」，避免与轮询作业并存造成重复抓取
+        for job in self.scheduler.get_jobs():
+            if job.id.startswith('monitor_') and job.id != 'monitor_cycle':
                 try:
-                    self.scheduler.add_job(
-                        func=self.run_monitor,
-                        trigger='date',
-                        run_date=datetime.now() + timedelta(seconds=15),
-                        args=[config['id']],
-                        id=f"monitor_immediate_{config['id']}",
-                        replace_existing=True,
-                        misfire_grace_time=600,
-                    )
-                    logger.info(f"已安排启动后立即检查: {config['name']} (ID: {config['id']})")
-                except Exception as e:
-                    logger.error(f"安排启动后立即检查失败: {str(e)}")
-        
+                    self.scheduler.remove_job(job.id)
+                except Exception:
+                    pass
+
+        if auto_configs:
+            cycle_minutes = min(
+                self._resolve_schedule_interval_minutes(c) for c in auto_configs
+            )
+            ids = [c['id'] for c in auto_configs]
+            try:
+                self.scheduler.add_job(
+                    func=self.run_monitor_cycle,
+                    trigger='interval',
+                    minutes=cycle_minutes,
+                    id='monitor_cycle',
+                    replace_existing=True,
+                    next_run_time=datetime.now() + timedelta(seconds=15 if immediate else 60),
+                    max_instances=1,
+                    coalesce=True,
+                )
+                logger.info(
+                    "已启动监控轮询作业：每 %d 分钟依次跑完 %d 个配置（首个 15 秒后开始）",
+                    cycle_minutes, len(ids),
+                )
+            except Exception as e:
+                logger.error("启动监控轮询作业失败: %s", e)
+
         if not self.scheduler.running:
             self.scheduler.start()
             logger.info("调度器已启动")
-        
-        logger.info(f"所有自动调度任务启动完成，共 {len(auto_configs)} 个任务")
+
+    def run_monitor_cycle(self):
+        """一轮监控：按顺序把每个启用的自动配置各跑一遍。
+
+        串行执行，同一时刻只有一个配置在抓取，避免并发请求打爆代理；
+        单个配置失败不影响后续配置。
+        """
+        configs = [
+            c for c in self.get_monitor_configs()
+            if c.get('enabled') and c.get('schedule_type') == 'auto'
+        ]
+        if not configs:
+            return
+
+        total = len(configs)
+        logger.info("=== 开始本轮监控，共 %d 个配置 ===", total)
+
+        ok = failed = 0
+        for index, cfg in enumerate(configs, 1):
+            cid = cfg['id']
+            name = cfg.get('name') or f'ID-{cid}'
+            try:
+                logger.info("本轮进度 %d/%d: %s", index, total, name)
+                success, message = self.run_monitor(cid)
+                if success:
+                    ok += 1
+                else:
+                    failed += 1
+                    logger.warning("配置 %s 本轮失败: %s", name, message)
+            except Exception as exc:
+                failed += 1
+                logger.error("配置 %s 本轮异常: %s", name, exc)
+
+        logger.info("=== 本轮监控结束：成功 %d，失败 %d ===", ok, failed)
     
     def stop_all_schedules(self):
         """停止所有调度任务"""

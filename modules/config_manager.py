@@ -61,6 +61,15 @@ DEFAULT_CONFIG = {
     # （见 modules/tag_presets.py）。PRESET_TAGS 每行一个，也接受逗号/顿号/分号分隔。
     "PRESET_TAGS_ENABLED": False,
     "PRESET_TAGS": "",
+    # 专有名词术语表（JSON 对象：原文 → 固定译名）。
+    # 不固定的话，模型每次都会现场音译角色名，同一角色在不同视频里出现多种写法，
+    # 观众会觉得「标题和内容对不上号」。命中词条时强制使用指定译名。
+    "METADATA_GLOSSARY": "{}",
+    # 译文规范化替换表（JSON 对象：模型可能写出的异形/别称 → 统一写法）。
+    # 术语表只能约束「原文命中时用哪个译名」，管不住同一概念的多种译法；
+    # 这里在模型输出之后做确定性替换，保证同系列视频的用词逐字一致。
+    # 留空则使用程序内置默认表。
+    "METADATA_TERM_NORMALIZE": "",
     "RECOMMEND_PARTITION": False,
     "RECOMMEND_PARTITION_WITH_COVER": False,
     "CONTENT_MODERATION_ENABLED": False,

@@ -1,6 +1,7 @@
 import ast
 import importlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -21,7 +22,7 @@ class BilibiliRuntimeTests(unittest.TestCase):
         self.assertIn("binaries=curl_cffi_binaries", source)
         self.assertIn("+ curl_cffi_hiddenimports", source)
 
-    def test_configure_runtime_sets_impersonate_once(self):
+    def test_configure_runtime_sets_impersonate_and_timeout_once(self):
         import modules.bilibili_runtime as runtime
 
         runtime = importlib.reload(runtime)
@@ -29,11 +30,18 @@ class BilibiliRuntimeTests(unittest.TestCase):
         fake_settings = types.SimpleNamespace(set=lambda key, value: calls.append((key, value)))
         fake_bili_sdk = types.SimpleNamespace(request_settings=fake_settings)
 
-        with mock.patch.dict(sys.modules, {"modules.bili_sdk": fake_bili_sdk}):
+        with mock.patch.dict(sys.modules, {"modules.bili_sdk": fake_bili_sdk}), \
+                mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("BILIBILI_UPLOAD_TIMEOUT", None)
             self.assertTrue(runtime.configure_bilibili_runtime())
             self.assertTrue(runtime.configure_bilibili_runtime())
 
-        self.assertEqual(calls, [("impersonate", "chrome131")])
+        # 只初始化一次：impersonate 与超时都应只设置一次。
+        # 默认 300s——SDK 自带 30s 会让大文件分块上传在中慢速上行下超时。
+        self.assertEqual(
+            calls,
+            [("impersonate", "chrome131"), ("timeout", 300.0)],
+        )
         self.assertIsNone(runtime.get_bilibili_runtime_error())
 
     def test_zone_wrapper_returns_sdk_data(self):

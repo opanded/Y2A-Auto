@@ -324,15 +324,27 @@ def _build_subtitle_download_args(
     # --no-write-auto-subs 在新版本中无效，无法可靠区分。
     # 因此当 YOUTUBE_AUTO_GENERATED_SUBTITLES_ENABLED=False 时，
     # 直接禁用字幕下载，让后续 ASR 流程负责生成字幕。
-    if not bool((config or {}).get('YOUTUBE_AUTO_GENERATED_SUBTITLES_ENABLED', False)):
+    cfg = config or {}
+    if not bool(cfg.get('YOUTUBE_AUTO_GENERATED_SUBTITLES_ENABLED', False)):
         return ['--no-write-subs']
 
-    return [
+    args = [
         '--write-subs',
-        '--all-subs',
         '--convert-subs', 'srt',
         '--write-auto-subs',
     ]
+
+    # 只取需要的语言。原实现用 --all-subs，一个视频能抓几十种语言的字幕
+    # （实测单个短视频 28~31 个 srt），每个都要单独建连下载，把「下载」
+    # 阶段拖成数分钟到十几分钟，还会在重试时反复抓一遍。
+    # 目标语言之外的字幕对翻译流程没有价值。
+    lang_expr = str(cfg.get('SUBTITLE_SOURCE_LANGUAGE_HINT') or '').strip()
+    if not lang_expr:
+        # 默认：原语言 + 英文。yt-dlp 的 langs 支持逗号列表与正则，
+        # 这里用「主语言 + 其国家变体」的常见组合。
+        lang_expr = 'ja,en,zh,zh-Hans,zh-Hant,ko'
+    args.extend(['--sub-langs', lang_expr])
+    return args
 
 
 def _is_format_selection_error(error_text: str | None) -> bool:
@@ -536,6 +548,24 @@ def merge_streams_with_ffmpeg(task_dir: str, ffmpeg_path: str | None = None, log
 
     log.warning("所有可用ffmpeg路径均无法完成手动合并")
     return None
+
+
+def _output_indicates_already_downloaded(output) -> bool:
+    """判断 yt-dlp 是否因「目标文件已存在」而以非零码退出。
+
+    yt-dlp 遇到已完整下载的文件会输出
+    ``[download] <path> has already been downloaded`` 并以退出码 1 结束。
+    这是「无事可做」而不是失败：视频就在磁盘上，应当直接进入后续流程。
+    """
+    text = str(output or "")
+    if not text:
+        return False
+    markers = (
+        'has already been downloaded',
+        'already been downloaded',
+        '已下载过',
+    )
+    return any(m in text for m in markers)
 
 
 def build_proxy_url(config):
@@ -880,6 +910,9 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
         process = None
         output = ""
         manual_merge_success = False
+        # yt-dlp 对「文件已存在」返回非零码，但视频确实在磁盘上；
+        # 置真后由 download_success 判定复用该文件，避免误判失败。
+        already_downloaded = False
         cookiecloud_tried_in_download = False
 
         for attempt in range(max_retries):
@@ -1040,7 +1073,19 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                         raise RuntimeError("任务已取消")
                     
                     if process.returncode != 0:
-                        raise subprocess.CalledProcessError(process.returncode, cmd, output)
+                        # yt-dlp 在目标文件已完整存在时会以退出码 1 结束，
+                        # 输出里带 "has already been downloaded"。这不是失败：
+                        # 视频就在磁盘上，直接当作下载完成。
+                        # 原实现一律当失败抛出，导致「下载成功 → 判失败 → 重试
+                        # → 再判失败」的循环，实测单条任务白跑 3 轮共 100 分钟。
+                        if _output_indicates_already_downloaded(output):
+                            already_downloaded = True
+                            logger.info(
+                                "yt-dlp 报告文件已存在（退出码 %s），按下载完成处理",
+                                process.returncode,
+                            )
+                        else:
+                            raise subprocess.CalledProcessError(process.returncode, cmd, output)
                 else:
                     # 不需要进度回调时使用原来的方式，设置UTF-8编码
                     process = subprocess.run(
@@ -1062,6 +1107,14 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
             except subprocess.CalledProcessError as e:
                 if cancel_event is not None and cancel_event.is_set():
                     return False, "任务已取消"
+                # yt-dlp 在目标文件已完整存在时会以退出码 1 结束，输出里带
+                # "has already been downloaded"。这不是失败：视频就在磁盘上。
+                # 原实现一律当失败重试，实测单条任务白跑 3 轮共 100 分钟。
+                _maybe_existing = (output or "") + (getattr(e, 'stdout', '') or '')
+                if _output_indicates_already_downloaded(_maybe_existing):
+                    already_downloaded = True
+                    logger.info("yt-dlp 报告文件已存在，按下载完成处理")
+                    break
                 # CalledProcessError 的字符串形式会带上完整命令（含代理凭据），
                 # 因此这里只记录退出码，避免凭据泄露到日志。
                 logger.warning(
@@ -1199,7 +1252,12 @@ def download_video_data(youtube_url, task_id=None, cookies_file_path=None, skip_
                 continue
         
         # 处理输出结果 — 使用安全检查以防 process 未被创建
-        download_success = manual_merge_success or (process is not None and getattr(process, 'returncode', None) == 0)
+        # already_downloaded：yt-dlp 因文件已存在而退出，文件本身可复用
+        download_success = (
+            manual_merge_success
+            or already_downloaded
+            or (process is not None and getattr(process, 'returncode', None) == 0)
+        )
         if download_success:
             logger.info("下载完成，正在收集文件信息")
             

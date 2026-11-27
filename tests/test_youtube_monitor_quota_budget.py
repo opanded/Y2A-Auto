@@ -94,43 +94,48 @@ class YoutubeMonitorQuotaBudgetTests(unittest.TestCase):
         for _ in range(5):
             self.assertTrue(self.monitor._try_consume_quota(1))
 
-    # ---- 立即检查不绕过预算：仅首次（定时任务不存在时）安排 ----
+    # ---- 单一定时作业：无论多少配置，只挂一个 monitor_cycle ----
 
-    def test_start_all_schedules_immediate_only_when_job_absent(self):
+    def test_start_all_schedules_uses_single_cycle_job(self):
         # 创建两个自动调度配置
         c1 = self.monitor.create_monitor_config({"name": "auto-1", "schedule_type": "auto", "enabled": True})
         c2 = self.monitor.create_monitor_config({"name": "auto-2", "schedule_type": "auto", "enabled": True})
 
         scheduler = self.monitor.scheduler
 
-        def immediate_job_ids():
-            return {jid.id for jid in scheduler.get_jobs() if jid.id.startswith("monitor_immediate_")}
+        def cycle_job_ids():
+            return {jid.id for jid in scheduler.get_jobs() if jid.id == "monitor_cycle"}
 
-        def interval_job_ids():
-            return {jid.id for jid in scheduler.get_jobs() if jid.id.startswith("monitor_") and not jid.id.startswith("monitor_immediate_")}
+        def legacy_job_ids():
+            # 旧模型：每配置一个 monitor_<id> / monitor_immediate_<id>
+            return {
+                jid.id for jid in scheduler.get_jobs()
+                if jid.id.startswith("monitor_")
+                and jid.id != "monitor_cycle"
+            }
 
-        # 配置创建时已自动排好 interval 任务；模拟「定时任务此前不存在」的场景：
-        # 先移除 interval 任务，再启动，验证此时会安排立即检查。
-        self.monitor._remove_schedule(c1)
-        self.monitor._remove_schedule(c2)
-        self.assertEqual(len(interval_job_ids()), 0, "移除后不应有定时任务")
-
-        # 第一次启动：定时任务此前不存在 -> 安排立即检查
         self.monitor.start_all_schedules(immediate=True)
-        first_immediate = immediate_job_ids()
-        first_interval = interval_job_ids()
-        self.assertEqual(len(first_interval), 2, "应有两个定时任务")
-        self.assertEqual(len(first_immediate), 2, "首次启动应为两个配置都安排立即检查")
 
-        # 第二次启动（模拟设置保存触发的重启）：定时任务已存在 -> 不应再新增立即检查
+        # 无论配置数量，只应存在唯一的轮询作业
+        self.assertEqual(len(cycle_job_ids()), 1, "应只有一个 monitor_cycle 作业")
+        self.assertEqual(legacy_job_ids(), set(), "不应再为单个配置挂独立定时器")
+
+        # 再次启动（模拟设置保存触发的重启）不应产生重复作业
         self.monitor.start_all_schedules(immediate=True)
-        second_immediate = immediate_job_ids()
-        self.assertEqual(second_immediate, first_immediate, "再次启动时不应新增立即检查（避免绕过每日预算）")
-        self.assertEqual(len(interval_job_ids()), 2)
+        self.assertEqual(len(cycle_job_ids()), 1, "重复启动不应新增轮询作业")
+        self.assertEqual(legacy_job_ids(), set())
 
-        # immediate=False 时也不应新增
-        self.monitor.start_all_schedules(immediate=False)
-        self.assertEqual(immediate_job_ids(), first_immediate)
+        # 轮询周期取所有自动配置间隔的最小值
+        job = scheduler.get_job("monitor_cycle")
+        expected = min(
+            self.monitor._resolve_schedule_interval_minutes(self.monitor.get_monitor_config(cid))
+            for cid in (c1, c2)
+        )
+        self.assertEqual(job.trigger.interval.total_seconds(), expected * 60)
+
+        # 配置被禁用后重排，轮询作业仍在（run_monitor_cycle 会按启用集合过滤）
+        self.monitor.update_monitor_config(c1, {"name": "auto-1", "enabled": False})
+        self.assertEqual(len(cycle_job_ids()), 1)
 
 
 class QuotaPersistenceAndAtomicTests(unittest.TestCase):
@@ -429,7 +434,11 @@ class ExecuteWithRetryQuotaTests(unittest.TestCase):
 
 
 class DisableCancelsImmediateTests(unittest.TestCase):
-    """PR #127 第三轮：禁用配置取消立即任务 + run_monitor 入口复核状态。"""
+    """禁用配置后的调度行为 + run_monitor 入口复核状态。
+
+    单一定时作业模型下已不存在 monitor_immediate_<id>；这里验证：
+    遗留的旧作业会被清理，且 _remove_schedule 不会误删 monitor_cycle。
+    """
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -456,20 +465,27 @@ class DisableCancelsImmediateTests(unittest.TestCase):
             self.init_api_patcher.stop()
             shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_remove_schedule_cancels_immediate_job(self):
+    def test_remove_schedule_cleans_legacy_jobs_only(self):
         cid = self.monitor.create_monitor_config(
             {"name": "auto", "schedule_type": "auto", "enabled": True})
-        # 先移除 interval，再启动 → 模拟首次启动，立即任务被安排
+        self.monitor.start_all_schedules(immediate=False)
+        self.assertIsNotNone(self.monitor.scheduler.get_job("monitor_cycle"))
+
+        # 模拟从旧版本升级：残留的每配置定时器
+        legacy_id = f"monitor_{cid}"
+        self.monitor.scheduler.add_job(
+            func=lambda: None, trigger='interval', minutes=60, id=legacy_id,
+        )
+
         self.monitor._remove_schedule(cid)
-        self.monitor.start_all_schedules(immediate=True)
-        immediate_id = f"monitor_immediate_{cid}"
-        interval_id = f"monitor_{cid}"
-        self.assertIsNotNone(self.monitor.scheduler.get_job(immediate_id))
-        self.assertIsNotNone(self.monitor.scheduler.get_job(interval_id))
-        # 禁用/删除时 _remove_schedule 必须同时取消立即任务
-        self.monitor._remove_schedule(cid)
-        self.assertIsNone(self.monitor.scheduler.get_job(immediate_id))
-        self.assertIsNone(self.monitor.scheduler.get_job(interval_id))
+
+        # 遗留作业被清掉，统一轮询作业不受影响
+        self.assertIsNone(self.monitor.scheduler.get_job(legacy_id))
+        self.assertIsNone(self.monitor.scheduler.get_job(f"monitor_immediate_{cid}"))
+        self.assertIsNotNone(
+            self.monitor.scheduler.get_job("monitor_cycle"),
+            "_remove_schedule 不应误删 monitor_cycle",
+        )
 
     def test_run_monitor_skips_when_config_disabled(self):
         # 让 API 对象存在以绕过 init 检查，走到 enabled 复核

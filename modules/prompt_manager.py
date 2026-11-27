@@ -139,6 +139,16 @@ _METADATA_BUILTIN_BEHAVIOR = (
     "只允许重述原文事实，删除导流、社媒、外链、联系方式和互动引导。"
     "title 必须是自然单行标题；description 必须是自然简介，可多段，但不能写成列表、备注或说明。"
     "禁止补充新事实、解释或备注。"
+    # 术语与格式稳定性：同一系列视频必须逐字一致，否则观众会误以为标题张冠李戴
+    "译名稳定性要求："
+    "作品名、角色名、活动名、制作方等专有名词在同一译文中必须唯一且前后一致，"
+    "同一原词不得出现两种写法；不得自行音译、意译出与常见译名不同的新名字。"
+    "格式稳定性要求："
+    "保留原文的结构与分隔符号（如「」『』【】《》（）以及冒号、斜杠、竖线、×），"
+    "只做必要的全角半角与语序调整，不得擅自增删括号、"
+    "不得擅自添加原文没有的「篇」「完整版」等后缀，"
+    "也不得改写原文已有的话数、弹数、集数、版本号与百分比。"
+    "若原文是系列化命名（同一前缀/后缀重复出现），译文必须沿用同一套命名结构。"
 )
 
 # ---------- 简介重试 Prompt ----------
@@ -463,16 +473,43 @@ def get_subtitle_strict_system_prompt(
 # 元数据翻译专用 API（封装协议壳）
 # ---------------------------------------------------------------------------
 
+def _build_glossary_block(glossary) -> str:
+    """把术语表拼成 prompt 片段。空表返回空串。
+
+    专有名词（角色名、作品名）如果每次都让模型现场音译，同一角色在不同视频里
+    会出现多种写法，观众看到的就是「标题对不上号」。这里强制固定译名。
+    """
+    if not glossary:
+        return ""
+    items = []
+    for src, dst in dict(glossary).items():
+        src_text = str(src or "").strip()
+        dst_text = str(dst or "").strip()
+        if src_text and dst_text:
+            items.append(f"{src_text}={dst_text}")
+    if not items:
+        return ""
+    # 控制 prompt 长度：超大词表按前 200 条截断
+    if len(items) > 200:
+        items = items[:200]
+    return (
+        "\n专有名词对照表（原文出现时必须使用右侧固定译名，不得自行音译、改写或省略）：\n"
+        + "；".join(items)
+    )
+
+
 def get_metadata_translate_prompt(
     *,
     mode: str = MODE_BUILTIN,
     user_text: str = "",
     target_language: str = "zh",
     retry: bool = False,
+    glossary=None,
 ) -> str:
     """获取元数据翻译最终 system prompt（含 JSON 后缀）。
 
     retry=True 时追加重试说明。
+    glossary: 可选术语表 {原文: 译名}，命中时强制使用固定译名。
     """
     behavior = get_final_system_prompt(
         "METADATA_TRANSLATE",
@@ -480,6 +517,9 @@ def get_metadata_translate_prompt(
         user_text=user_text,
         target_language=target_language,
     )
+    glossary_block = _build_glossary_block(glossary)
+    if glossary_block:
+        behavior = behavior + glossary_block
     suffix = _METADATA_JSON_SUFFIX
     if retry:
         suffix = "仅重写本次输入中提供的失败字段；无法安全输出时返回空字符串。" + suffix

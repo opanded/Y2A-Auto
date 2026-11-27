@@ -4184,6 +4184,7 @@ class TaskProcessor:
         for prompt_key in (
             'METADATA_TRANSLATE_MODE', 'METADATA_TRANSLATE_TEXT',
             'METADATA_DESC_RETRY_MODE', 'METADATA_DESC_RETRY_TEXT',
+            'METADATA_GLOSSARY', 'METADATA_TERM_NORMALIZE',
         ):
             if prompt_key in self.config:
                 openai_config[prompt_key] = self.config[prompt_key]
