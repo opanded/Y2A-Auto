@@ -978,9 +978,22 @@ class YouTubeMonitor:
             logger.info(f"筛选后剩余 {len(filtered_videos)} 个视频")
             
             # 历史搬运模式需要考虑偏移量
+            #
+            # 注意：historical_offset 是「历史回填已经投出去多少条」的累计值，
+            # 只能在首轮全量回填阶段用来跳过已处理的部分。一旦配置进入增量模式
+            # （last_run_time 游标生效，每轮只拿到上次之后的新视频），本批结果
+            # 可能只有几条，此时再按 offset 切片就会把新视频全部吃掉：
+            # 实测 aniplex 频道 offset=45、某轮增量只拿到 6 条，[45:] 为空，
+            # 17:00 发布的《業物語》PV 被永久丢弃。
             if config.get('channel_mode') == 'historical':
                 current_offset = config.get('historical_offset', 0)
-                if current_offset > 0:
+                if config.get('_used_incremental_cursor'):
+                    if filtered_videos:
+                        logger.info(
+                            "增量模式：忽略历史偏移量 %d（本批 %d 条全部参与筛选）",
+                            current_offset, len(filtered_videos),
+                        )
+                elif current_offset > 0:
                     logger.info(f"历史搬运模式，跳过前 {current_offset} 个视频")
                     filtered_videos = filtered_videos[current_offset:]
                     logger.info(f"应用偏移量后剩余 {len(filtered_videos)} 个视频")
@@ -1151,6 +1164,9 @@ class YouTubeMonitor:
                                 cursor,
                             )
                             published_after = cursor
+                            # 标记本轮是增量：历史回填偏移量不应再参与切片，
+                            # 否则 offset 会把本批仅有的新视频全部跳过。
+                            config['_used_incremental_cursor'] = True
                     except (ValueError, TypeError):
                         logger.debug("last_run_time 解析失败，沿用时间窗: %s", last_run_str)
             
@@ -2250,9 +2266,11 @@ class YouTubeMonitor:
                 conn.commit()
             
             logger.info(f"历史搬运偏移量更新为: {new_offset} (本次添加 {added_count} 个视频)")
-            
-            # 检查是否已经处理完所有视频
-            if new_offset >= len(all_filtered_videos):
+
+            # 只在「首轮全量回填」场景下用这批结果判断历史是否搬完。
+            # 增量模式下本批只包含上次之后的新视频，条数与历史总量无关，
+            # 用它做 >= 比较会误报「已完成」。
+            if not config.get('_used_incremental_cursor') and new_offset >= len(all_filtered_videos):
                 logger.info(f"历史搬运已完成！总共处理了 {new_offset} 个视频")
                 
         except Exception as e:
