@@ -1685,33 +1685,14 @@ def task_status_display(status):
     }
     return status_map.get(status, status)
 
-def task_failure_category(task):
-    """把失败原因归类，供界面提示「重试是否有用」。
-
-    返回 (阶段标签, 是否可重试, 颜色)。
-    """
-    msg = str((task or {}).get('error_message') or '')
-    cat = str((task or {}).get('error_category') or '')
-    if not msg and not cat:
-        return ('', True, 'secondary')
-
-    if cat == 'user_aborted' or '用户主动中止' in msg or '用户主动放弃' in msg:
-        return ('人工中止', False, 'secondary')
-    if 'not available in your count' in msg or '地区限制' in msg or 'geo' in cat:
-        return ('地区限制', False, 'secondary')
-    if 'this video is private' in msg or 'has been removed' in msg or 'unavailable' in msg:
-        return ('视频不可用', False, 'secondary')
-    if '下载' in msg:
-        return ('下载失败', True, 'warning')
-    if '翻译' in msg or '元数据' in msg or '简介' in msg:
-        return ('AI 处理失败', True, 'warning')
-    if '137022' in msg or '投稿过于频繁' in msg or '限流' in msg:
-        return ('平台限流', True, 'warning')
-    if '-352' in msg or '603' in msg or '风控' in msg:
-        return ('账号风控', True, 'danger')
-    if '上传' in msg:
-        return ('上传失败', True, 'danger')
-    return ('未知原因', True, 'danger')
+# 失败归类只有一份实现（modules/task_view.py），这里转出以便模板与旧调用点继续用。
+from modules.task_view import (  # noqa: E402
+    task_failure_category,
+    task_status_icon,
+    prepare_task_view,
+    build_task_actions,
+    build_subtitle_warnings,
+)
 
 
 def task_status_color(status):
@@ -1901,6 +1882,9 @@ app.jinja_env.globals.update(
     parse_json=parse_json,
     get_aliyun_label_chinese=get_aliyun_label_chinese, # 添加新的辅助函数
     submit_api_badge=bilibili_submit_api_badge, # 任务列表里的投稿接口徽标
+    # 任务列表视图模型：按钮矩阵与字幕异常提示的唯一事实来源。
+    # 桌面表格与窄屏卡片都从它取数据，避免两套模板各写一遍判断。
+    prepare_task_view=prepare_task_view,
 )
 
 @app.route('/login', methods=['GET', 'POST'])
