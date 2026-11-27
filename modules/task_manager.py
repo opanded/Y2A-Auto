@@ -2200,6 +2200,12 @@ def update_task(task_id, silent=False, **kwargs):
                     'task_id': task_id,
                     'status': filtered_kwargs.get('status')
                 }
+                # 带上错误信息：前端靠它区分「刚启动上传」和「这次上传失败退回队列」。
+                # 后者状态同样是 pending，只凭 status 判断不出来（会一直转圈）。
+                if filtered_kwargs.get('error_message'):
+                    event_payload['error_message'] = filtered_kwargs.get('error_message')
+                if filtered_kwargs.get('retry_after'):
+                    event_payload['retry_after'] = filtered_kwargs.get('retry_after')
 
                 changed_fields = {key for key in filtered_kwargs.keys() if key != 'updated_at'}
                 if changed_fields == {'upload_progress'}:

@@ -152,11 +152,55 @@ class UploadProgressDomTests(unittest.TestCase):
         """上传启动瞬间状态仍是 pending，此时清状态会让进度条立刻消失。"""
         src = self._read('tasks.html')
         idx = src.index("payload.type === 'task_updated'")
-        window = src[idx:idx + 700]
+        window = src[idx:idx + 900]
         self.assertIn("newStatus === 'completed'", window)
         self.assertIn("newStatus === 'failed'", window)
         self.assertNotIn("newStatus !== 'uploading'", window,
                          '不应按「非 uploading 就清」判断：pending 是上传启动中的正常状态')
+
+    def test_pending_with_error_marks_failure(self):
+        """上传失败（137022 等）会退回 pending + error_message。
+
+        只按终态判断会让「上传中…」永远转下去——实测就是这个卡死。
+        必须把 pending + error_message 识别为「本次尝试失败」并显示原因。
+        """
+        src = self._read('tasks.html')
+        idx = src.index("payload.type === 'task_updated'")
+        window = src[idx:idx + 900]
+        self.assertIn("newStatus === 'pending' && errMsg", window)
+        self.assertIn('markUploadFailed', window)
+
+    def test_failure_restores_button(self):
+        """失败后按钮必须恢复可点，否则用户没法重试。"""
+        src = self._read('tasks.html')
+        idx = src.index('function markUploadFailed')
+        body = src[idx:idx + 1600]
+        self.assertIn('btn.disabled = false', body)
+        self.assertIn('originalHtml', body)
+
+    def test_failed_state_not_overwritten_by_late_progress(self):
+        """失败后可能还有一条滞后的 task_progress，不能把红色态刷回绿色。"""
+        src = self._read('tasks.html')
+        idx = src.index('function setUploadProgressState')
+        body = src[idx:idx + 700]
+        self.assertIn('state.failed', body)
+        self.assertIn('return', body)
+
+    def test_retry_clears_failed_flag(self):
+        """用户重新点上传是新的一次尝试，要显式清 failed。"""
+        src = self._read('tasks.html')
+        idx = src.index('async function handleAjaxUploadSubmit')
+        body = src[idx:idx + 1800]
+        self.assertIn('failed: false', body)
+
+    def test_event_payload_carries_error_message(self):
+        """后端 task_updated 事件必须带上 error_message，前端才能判断失败。"""
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        src = (root / 'modules' / 'task_manager.py').read_text(encoding='utf-8')
+        idx = src.index("event_type = 'task_updated'")
+        window = src[idx:idx + 700]
+        self.assertIn("event_payload['error_message']", window)
 
 
 if __name__ == '__main__':

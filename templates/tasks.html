@@ -1011,13 +1011,19 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 }
 
                 if (payload.type === 'task_updated') {
-                    // 进度状态只在任务真正落到终态（完成/失败）时才清。
-                    // 注意上传启动瞬间状态仍是 pending（后台线程还没接手），
-                    // 此时若清掉，刚显示的进度条会立刻消失（实测点完 1 秒就没了）。
+                    // 进度状态何时清、何时保留，取决于任务最终落到哪儿：
+                    //   completed / failed → 终态，清掉（行会重绘成最终样子）
+                    //   pending + error_message → 本次上传失败退回队列（137022 等），
+                    //     不清：把原因显示在进度条上，否则用户只看到「上传中」一直转
+                    //   uploading / 刚启动的 pending → 保留
                     const newStatus = eventData.status;
-                    if (manualUploadState.has(taskId) &&
-                        (newStatus === 'completed' || newStatus === 'failed')) {
-                        forgetUploadState(taskId);
+                    const errMsg = eventData.error_message;
+                    if (manualUploadState.has(taskId)) {
+                        if (newStatus === 'completed' || newStatus === 'failed') {
+                            forgetUploadState(taskId);
+                        } else if (newStatus === 'pending' && errMsg) {
+                            markUploadFailed(taskId, errMsg);
+                        }
                     }
                     refreshTaskFragment(taskId);
                     return;
@@ -1141,6 +1147,9 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     function rememberUploadState(taskId, patch) {
         if (!taskId) return;
         const prev = manualUploadState.get(taskId) || { percent: 0, text: '', failed: false };
+        // failed 不在这里自动清：失败后仍可能收到一条滞后的 task_progress，
+        // 若在这里重置成 false，红色失败提示会被旧进度覆盖回绿色。
+        // 只有用户重新点「立即上传」（handleAjaxUploadSubmit）才显式清 failed。
         manualUploadState.set(taskId, Object.assign({}, prev, patch));
     }
 
@@ -1219,6 +1228,9 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
     function setUploadProgressState(taskId, payload) {
         const boxes = findTaskUploadProgressBoxes(taskId);
         if (!boxes.length) return;
+        // 失败后不再接受进度更新：否则滞后的 task_progress 会把红色失败态刷回绿色
+        const state = manualUploadState.get(taskId);
+        if (state && state.failed) return;
 
         const progressText = typeof payload.upload_progress === 'string'
             ? payload.upload_progress.trim()
@@ -1251,6 +1263,13 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
                 label.textContent = message || '上传失败';
                 label.classList.add('text-danger');
             }
+            // 失败后按钮要恢复可点，否则用户没法重试（会一直卡在「上传中…」）
+            const row = box.closest('[data-task-id]');
+            const btn = row ? row.querySelector('form[data-ajax-upload="1"] button[type="submit"]') : null;
+            if (btn) {
+                btn.disabled = false;
+                if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
+            }
         });
         rememberUploadState(taskId, { failed: true, text: message || '上传失败' });
     }
@@ -1270,7 +1289,8 @@ tr.status-awaiting_manual_review td { background-color: rgba(255,193,7,0.05); }
         }
         // 必须先记状态再显示：SSE 的 task_updated 随时可能整行替换，
         // 只有记在 manualUploadState 里，restoreManualUploadIndicators 才能贴回来。
-        rememberUploadState(taskId, { percent: 0, text: '正在启动上传…' });
+        // failed 显式置 false——这是新的一次尝试，要覆盖上一次的失败态。
+        rememberUploadState(taskId, { percent: 0, text: '正在启动上传…', failed: false });
         showUploadProgress(taskId, { percent: 0, text: '正在启动上传…' });
 
         try {
