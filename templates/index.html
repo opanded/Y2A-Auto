@@ -90,7 +90,7 @@
     </div>
     <div class="col-6 col-md-3">
         <a class="card h-100 queue-stat-card kpi-link"
-           href="{{ url_for('tasks', status='in_progress') }}" title="查看等待处理的任务">
+           href="{{ url_for('tasks', status='pending') }}" title="查看等待处理的任务">
             <div class="card-body">
                 <div>
                     <div class="text-muted small">等待处理</div>
@@ -102,7 +102,7 @@
     </div>
     <div class="col-6 col-md-3">
         <a class="card h-100 queue-stat-card kpi-link"
-           href="{{ url_for('tasks', status='upload_pending') }}" title="查看待上传任务，可批量上传">
+           href="{{ url_for('tasks', status='ready_for_upload') }}" title="查看待上传任务，可批量上传">
             <div class="card-body">
                 <div>
                     <div class="text-muted small">准备上传</div>

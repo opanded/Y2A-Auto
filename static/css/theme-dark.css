@@ -286,12 +286,17 @@
 /* 项目自绘的卡片（设置页 / 任务卡） */
 [data-theme="dark"] .settings-card,
 [data-theme="dark"] .task-card,
-[data-theme="dark"] .modern-list,
-[data-theme="dark"] .monitor-card {
+[data-theme="dark"] .modern-list {
     background-color: var(--y2a-bg-elevated) !important;
     border-color: var(--y2a-border) !important;
     color: var(--y2a-text);
     box-shadow: 0 1px 3px var(--y2a-shadow);
+}
+
+/* .monitor-card 不在这里设底色：它改成玻璃卡片后由 art.css 负责
+   （半透明底 + backdrop-filter）。!important 会盖掉玻璃效果。 */
+[data-theme="dark"] .monitor-card {
+    color: var(--y2a-text);
 }
 
 [data-theme="dark"] .settings-card-header,

@@ -1119,17 +1119,19 @@ body {
     text-shadow: 0 1px 2px rgba(0,0,0,.15);
 }
 
-/* 表格列宽设置（总和≤100%，避免出现横向滚动条） */
+/* 表格列宽设置（总和≤100%，避免出现横向滚动条）。
+   标签列从 9% 提到 12%：标签一多就会在窄列里竖着堆成一列，
+   行高被撑到 6 行。加宽后能排成 2~3 行，扫读更快。 */
 .tasks-table th.col-select { width: 3%; }
-.tasks-table th.col-id { width: 9%; }
-.tasks-table th.col-title { width: 18%; }
-.tasks-table th.col-status { width: 10%; }
-.tasks-table th.col-time { width: 9%; }
+.tasks-table th.col-id { width: 8%; }
+.tasks-table th.col-title { width: 17%; }
+.tasks-table th.col-status { width: 9%; }
+.tasks-table th.col-time { width: 8%; }
 .tasks-table th.col-platform { width: 6%; }
 .tasks-table th.col-partition { width: 9%; }
-.tasks-table th.col-tags { width: 9%; }
-.tasks-table th.col-result { width: 10%; }
-.tasks-table th.col-actions { width: 17%; }
+.tasks-table th.col-tags { width: 12%; }
+.tasks-table th.col-result { width: 9%; }
+.tasks-table th.col-actions { width: 19%; }
 
 /* ID 单元格：短 ID 常显，复制按钮悬停浮现，避免窄列里图标被裁掉 */
 .tasks-table .id-cell {
@@ -1219,6 +1221,9 @@ body {
     white-space: nowrap;
     display: inline-block;
     vertical-align: bottom;
+    /* 标签徽章在窄列里收窄一点，同样的宽度能多排一个 */
+    font-size: .68rem;
+    padding: .18em .45em;
 }
 
 /* 操作按钮样式 */

@@ -259,6 +259,355 @@ header .navbar {
     color: #0d6efd;
 }
 
+/* ==========================================================================
+   监控配置：玻璃质感卡片
+   --------------------------------------------------------------------------
+   原先是 7 列宽表，12 个配置要横向扫视、还要把参数挤在小字里。
+   改成网格卡片后，每张卡自带「名称 / 类型 / 模式 / 过滤条件 / 运行状态」，
+   一屏能看全 6~8 个配置，且不再依赖横向滚动。
+   玻璃感 = 半透明底 + backdrop-filter + 内细环 + 顶部高光。
+   ========================================================================== */
+
+/* 玻璃要「有东西可折射」才显得像玻璃。背景是纯色时 backdrop-filter 看不出来，
+   所以在网格底下铺两团低饱和色光，卡片透过去就有了层次。 */
+.monitor-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: .9rem;
+    position: relative;
+}
+
+.monitor-grid::before {
+    content: "";
+    position: absolute;
+    inset: -1.5rem -.5rem;
+    z-index: 0;
+    pointer-events: none;
+    border-radius: 1.5rem;
+    background:
+        radial-gradient(38% 42% at 18% 8%, rgba(13, 110, 253, .16), transparent 70%),
+        radial-gradient(34% 40% at 82% 34%, rgba(124, 92, 255, .14), transparent 72%),
+        radial-gradient(30% 34% at 48% 92%, rgba(13, 202, 240, .12), transparent 70%);
+}
+
+[data-theme="dark"] .monitor-grid::before {
+    background:
+        radial-gradient(38% 42% at 18% 8%, rgba(77, 143, 253, .22), transparent 70%),
+        radial-gradient(34% 40% at 82% 34%, rgba(124, 92, 255, .18), transparent 72%),
+        radial-gradient(30% 34% at 48% 92%, rgba(13, 202, 240, .14), transparent 70%);
+}
+
+.monitor-card {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    border-radius: .9rem;
+    padding: .85rem .95rem .7rem;
+    /* 玻璃本体：底色只给一点点，让背景颗粒透上来 */
+    background-color: rgba(255, 255, 255, .62);
+    backdrop-filter: blur(14px) saturate(150%);
+    -webkit-backdrop-filter: blur(14px) saturate(150%);
+    border: 1px solid rgba(255, 255, 255, .7);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .9),
+        inset 0 0 0 1px rgba(13, 110, 253, .06),
+        0 1px 2px rgba(15, 23, 42, .04),
+        0 14px 30px -22px rgba(13, 110, 253, .5);
+    transition: transform .26s cubic-bezier(.2, .7, .3, 1),
+                box-shadow .26s cubic-bezier(.2, .7, .3, 1),
+                border-color .26s ease;
+}
+
+/* 顶部一道斜向高光，玻璃的「反射」来源 */
+.monitor-card::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 52%;
+    border-radius: inherit;
+    background: linear-gradient(160deg, rgba(255, 255, 255, .75), rgba(255, 255, 255, 0) 62%);
+    pointer-events: none;
+}
+
+.monitor-card > * {
+    position: relative;
+}
+
+.monitor-card:hover {
+    transform: translateY(-2px);
+    border-color: rgba(13, 110, 253, .28);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .9),
+        inset 0 0 0 1px rgba(13, 110, 253, .1),
+        0 2px 4px rgba(15, 23, 42, .05),
+        0 20px 40px -22px rgba(13, 110, 253, .6);
+}
+
+/* 禁用的配置整体压暗，但仍可读（不是 disabled 控件） */
+.monitor-card.is-disabled {
+    opacity: .72;
+}
+
+.monitor-card.is-disabled::after {
+    content: "已停用";
+    position: absolute;
+    top: .55rem;
+    right: .7rem;
+    font-size: .68rem;
+    letter-spacing: .06em;
+    color: var(--y2a-text-muted);
+}
+
+/* ---------- 卡片内部 ---------- */
+.mc-head {
+    margin-bottom: .55rem;
+}
+
+.mc-title {
+    display: flex;
+    flex-direction: column;
+    gap: .35rem;
+}
+
+.mc-name {
+    font-weight: 700;
+    font-size: 1rem;
+    line-height: 1.25;
+    color: var(--y2a-text);
+    overflow-wrap: anywhere;
+}
+
+.mc-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .28rem;
+}
+
+.mc-body {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    gap: .3rem;
+    font-size: .82rem;
+    color: var(--y2a-text);
+    margin-bottom: .6rem;
+}
+
+.mc-line {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: .3rem;
+    line-height: 1.5;
+}
+
+.mc-line > i {
+    opacity: .8;
+    font-size: .9em;
+}
+
+.mc-sep {
+    opacity: .35;
+}
+
+/* 视频类型：细描边小片，不用实心徽章，避免和状态徽章抢注意力 */
+.mc-chip {
+    display: inline-block;
+    padding: .05rem .4rem;
+    border-radius: .35rem;
+    font-size: .72rem;
+    line-height: 1.5;
+    color: var(--y2a-text);
+    background: rgba(13, 110, 253, .1);
+    border: 1px solid rgba(13, 110, 253, .18);
+}
+
+.mc-chip.is-short {
+    background: rgba(13, 202, 240, .12);
+    border-color: rgba(13, 202, 240, .24);
+}
+
+.mc-chip.is-live {
+    background: rgba(220, 53, 69, .1);
+    border-color: rgba(220, 53, 69, .22);
+}
+
+.mc-filter .mc-kw {
+    font-family: var(--bs-font-monospace);
+    font-size: .76rem;
+    padding: .05rem .35rem;
+    border-radius: .3rem;
+    background: rgba(13, 110, 253, .08);
+    overflow-wrap: anywhere;
+}
+
+.mc-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: .5rem;
+    padding-top: .55rem;
+    border-top: 1px solid rgba(13, 110, 253, .1);
+}
+
+.mc-meta {
+    font-size: .74rem;
+    color: var(--y2a-text-muted);
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: .3rem;
+    min-width: 0;
+}
+
+.mc-actions {
+    display: flex;
+    align-items: center;
+    gap: .25rem;
+    flex-shrink: 0;
+}
+
+/* ---------- 深色：玻璃改成「暗色玻璃」 ---------- */
+[data-theme="dark"] .monitor-card {
+    background-color: rgba(30, 35, 44, .55);
+    border-color: rgba(120, 150, 220, .18);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .07),
+        inset 0 0 0 1px rgba(120, 150, 220, .06),
+        0 1px 2px rgba(0, 0, 0, .4),
+        0 18px 38px -26px rgba(0, 0, 0, .9);
+}
+
+[data-theme="dark"] .monitor-card::before {
+    background: linear-gradient(160deg, rgba(255, 255, 255, .09), rgba(255, 255, 255, 0) 58%);
+}
+
+[data-theme="dark"] .monitor-card:hover {
+    border-color: rgba(120, 150, 220, .34);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, .09),
+        inset 0 0 0 1px rgba(120, 150, 220, .12),
+        0 2px 4px rgba(0, 0, 0, .45),
+        0 22px 44px -24px rgba(0, 0, 0, .95);
+}
+
+[data-theme="dark"] .mc-chip {
+    background: rgba(77, 143, 253, .16);
+    border-color: rgba(77, 143, 253, .28);
+    color: #cfd8e6;
+}
+
+[data-theme="dark"] .mc-chip.is-short {
+    background: rgba(57, 169, 214, .16);
+    border-color: rgba(57, 169, 214, .3);
+}
+
+[data-theme="dark"] .mc-chip.is-live {
+    background: rgba(248, 81, 73, .16);
+    border-color: rgba(248, 81, 73, .3);
+}
+
+[data-theme="dark"] .mc-filter .mc-kw {
+    background: rgba(77, 143, 253, .12);
+    color: #cfd8e6;
+}
+
+[data-theme="dark"] .mc-foot {
+    border-top-color: rgba(120, 150, 220, .16);
+}
+
+/* 窄屏：单列，避免 340px 最小宽度撑出横向滚动 */
+@media (max-width: 575.98px) {
+    .monitor-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* ---------- 窄屏导航菜单 ----------
+   < 992px 时三横线是唯一导航入口（宽屏下 Bootstrap 会隐藏它，不存在重复）。
+   但展开后是一整条蓝色横条，把正文整个推下去，看着像「另一个导航页」。
+   改成从导航栏垂下的小浮层：半透明 + 模糊，只占需要的高度。 */
+@media (max-width: 991.98px) {
+    .navbar-shell {
+        position: relative;
+    }
+
+    .navbar-shell .navbar-collapse {
+        position: absolute;
+        top: calc(100% + .35rem);
+        right: .75rem;
+        left: auto;
+        min-width: 12rem;
+        max-width: calc(100vw - 1.5rem);
+        z-index: 1050;
+        padding: .35rem;
+        border-radius: .75rem;
+        background: rgba(16, 42, 90, .92);
+        backdrop-filter: blur(14px) saturate(160%);
+        -webkit-backdrop-filter: blur(14px) saturate(160%);
+        border: 1px solid rgba(255, 255, 255, .16);
+        box-shadow: 0 18px 40px -18px rgba(0, 0, 0, .7);
+    }
+
+    .navbar-shell .navbar-collapse .navbar-nav {
+        gap: .1rem;
+    }
+
+    .navbar-shell .navbar-collapse .nav-link {
+        padding: .5rem .65rem;
+        border-radius: .5rem;
+    }
+
+    .navbar-shell .navbar-collapse .nav-link:hover,
+    .navbar-shell .navbar-collapse .nav-link.active {
+        background: rgba(255, 255, 255, .12);
+    }
+
+    [data-theme="dark"] .navbar-shell .navbar-collapse {
+        background: rgba(18, 24, 36, .95);
+        border-color: rgba(120, 150, 220, .2);
+    }
+}
+
+/* ---------- 标签：多出来的部分收进可展开的 +N ---------- */
+.tag-more {
+    display: inline-block;
+    position: relative;
+}
+
+.tag-more > summary {
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+}
+
+.tag-more > summary::-webkit-details-marker {
+    display: none;
+}
+
+.tag-more[open] > summary {
+    color: var(--y2a-text-muted) !important;
+}
+
+/* 展开后的补全标签走文档流而不是绝对定位：
+   标签单元格带 overflow: hidden（防徽章溢出到相邻列），
+   绝对定位的浮层会被直接裁掉。行高只在用户点开时增加，可接受。 */
+.tag-more-panel {
+    margin-top: .25rem;
+    max-width: 100%;
+    padding: .35rem .4rem .15rem;
+    border-radius: .5rem;
+    background: rgba(255, 255, 255, .55);
+    border: 1px solid var(--art-hairline-strong);
+    display: flex;
+    flex-wrap: wrap;
+}
+
+[data-theme="dark"] .tag-more-panel {
+    background: rgba(255, 255, 255, .05);
+}
+
 /* ---------- 动效开关 ---------- */
 @media (prefers-reduced-motion: reduce) {
     .card,

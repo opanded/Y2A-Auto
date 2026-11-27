@@ -204,12 +204,25 @@
     <td>
         {% if task.tags_generated %}
             {% set tags = parse_json(task.tags_generated) %}
+            {# 标签列只有约 12% 宽，放太多会竖着堆成好几行、把行高撑开。
+               这里给 4 个 + 可展开的 +N：比原来只看 3 个多，又不会破坏扫读。 #}
+            {% set _visible = 4 %}
             <div class="tags-container">
-                {% for tag in tags[:3] %}
+                {% for tag in tags[:_visible] %}
                     <span class="badge bg-secondary me-1 mb-1">{{ tag }}</span>
                 {% endfor %}
-                {% if tags|length > 3 %}
-                    <span class="badge bg-light text-dark me-1 mb-1">+{{ tags|length - 3 }}</span>
+                {% if tags|length > _visible %}
+                    {% set _rest = tags[_visible:] %}
+                    <details class="tag-more">
+                        <summary class="badge bg-light text-dark me-1 mb-1" title="还有 {{ _rest|length }} 个标签，点击展开">
+                            +{{ _rest|length }}
+                        </summary>
+                        <div class="tag-more-panel">
+                            {% for tag in _rest %}
+                                <span class="badge bg-secondary me-1 mb-1">{{ tag }}</span>
+                            {% endfor %}
+                        </div>
+                    </details>
                 {% endif %}
             </div>
         {% else %}
@@ -343,8 +356,26 @@
     </td>
     <td>
         <div class="d-flex justify-content-end gap-1 flex-wrap">
-            {# 处理中状态：只提供「中止」，避免误以为卡死也不知道怎么停 #}
-            {% if task.status in ('downloading', 'downloaded', 'asr_transcribing',
+            {# 处理中状态：只提供「中止」，避免误以为卡死也不知道怎么停。
+               已下载（downloaded）例外——素材已在本地，用户点进来就是要能手动投，
+               所以额外给一个「上传」，不再强迫等自动流程往下走。 #}
+            {% if task.status == 'downloaded' %}
+                <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                    <button type="submit" class="btn btn-sm btn-success d-flex align-items-center justify-content-center task-action-btn"
+                            title="素材已下载完成，立即上传（缺少的元数据会自动补齐）">
+                        <i class="bi bi-cloud-upload me-1"></i> 上传
+                    </button>
+                </form>
+                <form method="post" action="{{ url_for('abandon_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                    <input type="hidden" name="delete_files" value="false">
+                    <input type="hidden" name="back" value="{{ request.full_path }}">
+                    <button type="submit" class="btn btn-sm btn-outline-secondary d-flex align-items-center justify-content-center task-action-btn"
+                            onclick="return confirm('确定中止该任务？将停止当前的处理流程。')">
+                        <i class="bi bi-stop-circle me-1"></i> 中止
+                    </button>
+                </form>
+
+            {% elif task.status in ('downloading', 'asr_transcribing',
                                   'translating_subtitle', 'encoding_video', 'translating',
                                   'tagging', 'partitioning', 'moderating', 'uploading',
                                   'fetching_info', 'info_fetched') %}
@@ -370,12 +401,19 @@
                 </form>
 
             {% elif task.status == 'pending' %}
-                {# 限流冷却中的 pending 不能立刻开始，避免点了没反应 #}
+                {# 冷却中的任务默认会自动重试，但用户进来就是要手动操作，
+                   所以保留可点的「立即上传」，只把冷却时间作为提示标注出来。 #}
                 {% if task.retry_after %}
-                    <button type="button" class="btn btn-sm btn-outline-secondary d-flex align-items-center justify-content-center task-action-btn"
-                            disabled title="平台限流冷却中，{{ task.retry_after }} 自动重试">
-                        <i class="bi bi-hourglass me-1"></i> 等待中
-                    </button>
+                    <form method="post" action="{{ url_for('force_upload_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
+                        <button type="submit" class="btn btn-sm btn-success d-flex align-items-center justify-content-center task-action-btn"
+                                title="该任务原定 {{ task.retry_after }} 自动重试，点此立即上传">
+                            <i class="bi bi-cloud-upload me-1"></i> 立即上传
+                        </button>
+                    </form>
+                    <span class="badge bg-secondary d-inline-flex align-items-center"
+                          title="平台限流冷却中，{{ task.retry_after }} 将自动重试">
+                        <i class="bi bi-hourglass-split me-1"></i>{{ task.retry_after[11:16] }} 自动重试
+                    </span>
                 {% else %}
                     <form method="post" action="{{ url_for('start_task_route', task_id=task.id) }}" class="m-0 p-0 d-inline">
                         <button type="submit" class="btn btn-sm btn-primary d-flex align-items-center justify-content-center task-action-btn">

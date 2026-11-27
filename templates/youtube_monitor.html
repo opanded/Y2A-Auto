@@ -17,134 +17,130 @@
     </div>
 </div>
 
-<!-- 监控配置列表 -->
+<!-- 监控配置：卡片式（表格在 12 个配置时要横向扫 7 列，读一屏只能看到 5 条） -->
 <div class="row mb-5">
     <div class="col-12">
-        <h4><i class="bi bi-list-ul"></i> 监控配置</h4>
+        <div class="d-flex align-items-center justify-content-between mb-3">
+            <h4 class="mb-0"><i class="bi bi-list-ul"></i> 监控配置</h4>
+            {% if configs %}
+            <span class="text-muted small">
+                共 {{ configs|length }} 个 ·
+                启用 {{ configs|selectattr('enabled')|list|length }} 个
+            </span>
+            {% endif %}
+        </div>
+
         {% if configs %}
-        <div class="table-responsive">
-            <table class="table table-striped table-hover align-middle youtube-monitor-table">
-                <thead class="table-dark">
-                    <tr>
-                        <th class="col-name">名称</th>
-                        <th class="text-center">状态</th>
-                        <th class="text-center">监控类型</th>
-                        <th>参数</th>
-                        <th class="text-center">调度类型</th>
-                        <th>最后运行</th>
-                        <th>操作</th>
-                    </tr>
-                </thead>
-        <tbody>
-                    {% for config in configs %}
-                    <tr>
-            <td data-label="名称">
-                            <strong>{{ config.name }}</strong>
-                            {% if config.monitor_type == 'youtube_search' and config.keywords %}
-                                <br><small class="text-muted" title="{{ config.keywords }}">关键词: {{ config.keywords[:30] }}{% if config.keywords|length > 30 %}...{% endif %}</small>
-                            {% elif config.monitor_type == 'channel_monitor' and config.channel_ids %}
-                                <br><small class="text-muted" title="{{ config.channel_ids }}">频道ID: {{ config.channel_ids.split(',')[0][:20] }}...</small>
-                            {% endif %}
-                        </td>
-                        <td class="text-center" data-label="状态">
+        <div class="monitor-grid">
+            {% for config in configs %}
+            <article class="monitor-card{% if not config.enabled %} is-disabled{% endif %}"
+                     data-config-id="{{ config.id }}">
+                <header class="mc-head">
+                    <div class="mc-title">
+                        <span class="mc-name" title="{{ config.name }}">{{ config.name }}</span>
+                        <div class="mc-badges">
                             {% if config.enabled %}
-                            <span class="badge bg-success">启用</span>
+                                <span class="badge bg-success">启用</span>
                             {% else %}
-                            <span class="badge bg-secondary">禁用</span>
+                                <span class="badge bg-secondary">禁用</span>
                             {% endif %}
-                        </td>
-                        <td class="text-center" data-label="监控类型">
-                            {% if config.monitor_type == 'channel_monitor' %}
+                            {% if config.monitor_type in ('channel_monitor', 'channel') %}
                                 <span class="badge bg-primary">频道监控</span>
                             {% else %}
                                 <span class="badge bg-danger">全网搜索</span>
                             {% endif %}
-                        </td>
-                        <td data-label="参数">
-                            {% if config.monitor_type == 'channel_monitor' %}
-                                {% if config.channel_mode == 'latest' %}
-                                    <i class="bi bi-rss-fill text-success" title="持续跟进最新"></i> 持续跟进最新
-                                {% elif config.channel_mode == 'historical' %}
-                                    <i class="bi bi-clock-history text-info" title="历史视频搬运"></i> 
-                                    {% if config.start_date %}{{ config.start_date }} {% endif %}
-                                    → 
-                                    {% if config.end_date %}{{ config.end_date }}{% else %}最新{% endif %}
-                                {% elif config.channel_mode == 'search' %}
-                                    <i class="bi bi-search text-warning" title="频道内搜索"></i> 
-                                    <span title="{{ config.channel_keywords }}">关键词: {{ config.channel_keywords[:20] }}...</span>
-                                {% endif %}
-                                <br>
-                                {% set types = (config.video_types.split(',') if config.video_types else ['video','short','live']) %}
-                                <i class="bi bi-collection-play"></i>
-                                类型：
-                                {% if 'video' in types %}<span class="badge bg-secondary">普通</span>{% endif %}
-                                {% if 'short' in types %}<span class="badge bg-info text-dark">短</span>{% endif %}
-                                {% if 'live' in types %}<span class="badge bg-danger">直播</span>{% endif %}
-                            {% else %}
-                                <i class="bi bi-calendar-event" title="时间段"></i> 最近 {{ config.time_period or 7 }} 天
-                                <br>
-                                <i class="bi bi-sort-down" title="排序方式"></i> 
-                                {% if config.order_by == 'viewCount' %}观看数
-                                {% elif config.order_by == 'date' %}上传日期
-                                {% elif config.order_by == 'rating' %}评分
-                                {% elif config.order_by == 'relevance' %}相关度
-                                {% else %}{{ config.order_by }}
-                                {% endif %}
-                                <br>
-                                {% set types = (config.video_types.split(',') if config.video_types else ['video','short','live']) %}
-                                <i class="bi bi-collection-play"></i>
-                                类型：
-                                {% if 'video' in types %}<span class="badge bg-secondary">普通</span>{% endif %}
-                                {% if 'short' in types %}<span class="badge bg-info text-dark">短</span>{% endif %}
-                                {% if 'live' in types %}<span class="badge bg-danger">直播</span>{% endif %}
-                            {% endif %}
-                            {% if config.title_keywords %}
-                                <br>
-                                <i class="bi bi-funnel" title="标题包含关键词"></i>
-                                标题含{% if config.title_match_mode == 'all' %}（全部）{% endif %}: <span title="{{ config.title_keywords }}">{{ config.title_keywords[:20] }}{% if config.title_keywords|length > 20 %}...{% endif %}</span>
-                            {% endif %}
-                        </td>
-                        <td class="text-center" data-label="调度类型">
                             {% if config.schedule_type == 'auto' %}
-                            <span class="badge bg-info text-dark">自动({{ config.schedule_interval }}分钟)</span>
+                                <span class="badge bg-info text-dark">自动 {{ config.schedule_interval }}m</span>
                             {% else %}
-                            <span class="badge bg-warning text-dark">手动</span>
+                                <span class="badge bg-warning text-dark">手动</span>
                             {% endif %}
-                        </td>
-                        <td data-label="最后运行">
-                            {% if config.last_run_time %}
-                            <small>{{ config.last_run_time }}</small>
-                            {% else %}
-                            <small class="text-muted">从未运行</small>
+                        </div>
+                    </div>
+                </header>
+
+                <div class="mc-body">
+                    {% if config.monitor_type in ('channel_monitor', 'channel') %}
+                        <div class="mc-line">
+                            {% if config.channel_mode == 'latest' %}
+                                <i class="bi bi-rss-fill text-success"></i> 持续跟进最新
+                            {% elif config.channel_mode == 'historical' %}
+                                <i class="bi bi-clock-history text-info"></i>
+                                历史搬运 {% if config.start_date %}{{ config.start_date }}{% else %}起点{% endif %}
+                                → {% if config.end_date %}{{ config.end_date }}{% else %}最新{% endif %}
+                            {% elif config.channel_mode == 'search' %}
+                                <i class="bi bi-search text-warning"></i>
+                                <span title="{{ config.channel_keywords }}">频道内搜索：{{ config.channel_keywords[:24] }}</span>
                             {% endif %}
-                            {% if config.channel_mode == 'historical' and config.historical_offset %}
-                            <br><small class="text-info">已处理: {{ config.historical_offset }} 个视频</small>
+                        </div>
+                    {% else %}
+                        <div class="mc-line">
+                            <i class="bi bi-calendar-event"></i> 最近 {{ config.time_period or 7 }} 天
+                            <span class="mc-sep">·</span>
+                            <i class="bi bi-sort-down"></i>
+                            {% if config.order_by == 'viewCount' %}观看数
+                            {% elif config.order_by == 'date' %}上传日期
+                            {% elif config.order_by == 'rating' %}评分
+                            {% elif config.order_by == 'relevance' %}相关度
+                            {% else %}{{ config.order_by or '默认' }}
                             {% endif %}
-                        </td>
-                        <td data-label="操作">
-                            <div class="btn-group btn-group-sm" role="group">
-                                <form method="POST" action="{{ url_for('youtube_monitor_run', config_id=config.id) }}" class="d-inline monitor-run-form">
-                                    <button type="submit" class="btn btn-outline-success btn-icon" title="立即运行">
-                                        <i class="bi bi-play-fill"></i>
-                                    </button>
-                                </form>
-                                <a href="{{ url_for('youtube_monitor_history', config_id=config.id) }}" class="btn btn-outline-info btn-icon" title="查看历史">
-                                    <i class="bi bi-clock-history"></i>
-                                </a>
-                                <a href="{{ url_for('youtube_monitor_config_edit', config_id=config.id) }}" class="btn btn-outline-warning btn-icon" title="编辑">
-                                    <i class="bi bi-pencil"></i>
-                                </a>
-                                <form method="POST" action="{{ url_for('youtube_monitor_config_delete', config_id=config.id) }}" class="d-inline" onsubmit="return confirm('确定要删除监控配置 ' + {{ config.name|tojson }} + ' 吗？')">
-                                    <button type="submit" class="btn btn-outline-danger btn-icon" title="删除">
-                                        <i class="bi bi-trash"></i>
-                                    </button>
-                                </form>
-                            </div>
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+                        </div>
+                    {% endif %}
+
+                    {% set types = (config.video_types.split(',') if config.video_types else ['video','short','live']) %}
+                    <div class="mc-line mc-types">
+                        <i class="bi bi-collection-play"></i>
+                        {% if 'video' in types %}<span class="mc-chip">普通</span>{% endif %}
+                        {% if 'short' in types %}<span class="mc-chip is-short">短</span>{% endif %}
+                        {% if 'live' in types %}<span class="mc-chip is-live">直播</span>{% endif %}
+                        {% if config.monitor_type in ('channel_monitor', 'channel') and config.channel_ids %}
+                            <span class="mc-sep">·</span>
+                            <i class="bi bi-person-badge"></i>
+                            <span title="{{ config.channel_ids }}">{{ config.channel_ids.split(',')|length }} 个频道</span>
+                        {% endif %}
+                    </div>
+
+                    {% if config.title_keywords %}
+                        <div class="mc-line mc-filter" title="{{ config.title_keywords }}">
+                            <i class="bi bi-funnel"></i>
+                            标题含{% if config.title_match_mode == 'all' %}（全部）{% endif %}：
+                            <span class="mc-kw">{{ config.title_keywords[:36] }}{% if config.title_keywords|length > 36 %}…{% endif %}</span>
+                        </div>
+                    {% endif %}
+                </div>
+
+                <footer class="mc-foot">
+                    <div class="mc-meta">
+                        {% if config.last_run_time %}
+                            <i class="bi bi-clock"></i> {{ config.last_run_time }}
+                        {% else %}
+                            <i class="bi bi-clock"></i> <span class="text-muted">从未运行</span>
+                        {% endif %}
+                        {% if config.channel_mode == 'historical' and config.historical_offset %}
+                            <span class="mc-sep">·</span>
+                            <i class="bi bi-check2-circle text-info"></i> 已处理 {{ config.historical_offset }}
+                        {% endif %}
+                    </div>
+                    <div class="mc-actions">
+                        <form method="POST" action="{{ url_for('youtube_monitor_run', config_id=config.id) }}" class="d-inline monitor-run-form">
+                            <button type="submit" class="btn btn-sm btn-outline-success btn-icon" title="立即运行">
+                                <i class="bi bi-play-fill"></i>
+                            </button>
+                        </form>
+                        <a href="{{ url_for('youtube_monitor_history', config_id=config.id) }}" class="btn btn-sm btn-outline-info btn-icon" title="查看历史">
+                            <i class="bi bi-clock-history"></i>
+                        </a>
+                        <a href="{{ url_for('youtube_monitor_config_edit', config_id=config.id) }}" class="btn btn-sm btn-outline-warning btn-icon" title="编辑">
+                            <i class="bi bi-pencil"></i>
+                        </a>
+                        <form method="POST" action="{{ url_for('youtube_monitor_config_delete', config_id=config.id) }}" class="d-inline" onsubmit="return confirm('确定要删除监控配置 ' + {{ config.name|tojson }} + ' 吗？')">
+                            <button type="submit" class="btn btn-sm btn-outline-danger btn-icon" title="删除">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
+                    </div>
+                </footer>
+            </article>
+            {% endfor %}
         </div>
         {% else %}
         <div class="alert alert-info">

@@ -2331,6 +2331,10 @@ TASK_FILTER_GROUPS = {
 TASK_FILTER_OPTIONS = [
     ('', '全部任务'),
     ('upload_pending', '待上传'),
+    # 仪表盘按「等待处理」「准备上传」两个数字分别跳转，
+    # 这里必须有同名选项，否则下拉框显示「全部任务」但列表已被过滤，用户会困惑。
+    ('pending', '等待处理'),
+    ('ready_for_upload', '准备上传'),
     ('problem', '失败/需处理'),
     ('in_progress', '处理中'),
     ('done', '已完成'),
@@ -10878,8 +10882,17 @@ def force_upload_task(task_id, config=None):
         logger.error(f"任务 {task_id} 不存在")
         return False
     
-    # 允许状态为"等待人工审核"、"已完成"、"等待处理"或"准备上传"的任务进行上传
-    allowed_states = [TASK_STATES['AWAITING_REVIEW'], TASK_STATES['COMPLETED'], TASK_STATES['PENDING'], TASK_STATES['READY_FOR_UPLOAD']]
+    # 允许「等待人工审核 / 已完成 / 等待处理 / 准备上传 / 已下载」强制上传。
+    # 加入 downloaded：素材已落盘、用户点「上传」就是明确要求现在投，
+    # 缺的元数据由 _ensure_force_upload_metadata_ready 现补。
+    # 不放开 downloading / uploading：前者文件不完整，后者会与进行中的上传撞车。
+    allowed_states = [
+        TASK_STATES['AWAITING_REVIEW'],
+        TASK_STATES['COMPLETED'],
+        TASK_STATES['PENDING'],
+        TASK_STATES['READY_FOR_UPLOAD'],
+        TASK_STATES['DOWNLOADED'],
+    ]
     if task['status'] not in allowed_states:
         logger.warning(f"任务 {task_id} 状态为 {task['status']}，只有以下状态的任务可以上传: {', '.join(allowed_states)}")
         return False
