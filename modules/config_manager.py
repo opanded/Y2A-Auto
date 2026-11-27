@@ -225,6 +225,10 @@ DEFAULT_CONFIG = {
     "UPLOAD_RATE_LIMIT_RETRY_ENABLED": True,
     "UPLOAD_RATE_LIMIT_RETRY_MINUTES": 120,  # 冷却时长（分钟）
     "UPLOAD_RATE_LIMIT_MAX_RETRIES": 5,  # 最多退避重试轮数，0 表示不限
+    # 日配额耗尽（137022「投稿过于频繁」）单独处理：它要等自然日重置，
+    # 按分钟级冷却每 2 小时撞一次只会整夜空转。开启后直接顺延到
+    # DAILY_UPLOAD_RETRY_HOUR/MINUTE（默认次日 00:30）。
+    "UPLOAD_DAILY_QUOTA_DEFER_ENABLED": True,
     # 上传主动节流：上传信号量只限并发数，限不住「一条接一条」的发送速度。
     # 实测短间隔连发（最小 1 秒、中位 38 秒）约 24 条后即触发平台限流。
     "UPLOAD_PACE_ENABLED": True,

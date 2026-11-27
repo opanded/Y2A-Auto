@@ -93,3 +93,48 @@ class DownloadFailureClassificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThrottleDoesNotSleepHoldingLockTests(unittest.TestCase):
+    """preupload 406 不能在持有上传锁时 sleep。
+
+    上传锁是全局的（MAX_CONCURRENT_UPLOADS=1）。旧实现在锁内
+    sleep(600) 重试 5 次，一条被限流的任务会把后面所有任务饿死在
+    「等待获取上传锁」上（实测 3 条任务卡死 8 分钟以上）。
+    """
+
+    def _source(self):
+        return (ROOT / "modules" / "task_manager.py").read_text(encoding="utf-8")
+
+    def test_no_long_sleep_for_throttle_in_retry_wrapper(self):
+        import ast
+        source = self._source()
+        tree = ast.parse(source)
+        target = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_upload_bilibili_with_retry":
+                target = node
+                break
+        self.assertIsNotNone(target, "未找到 _upload_bilibili_with_retry")
+
+        # 收集该函数里出现的 time.sleep 实参
+        sleep_args = []
+        for node in ast.walk(target):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "sleep"):
+                sleep_args.append(ast.dump(node))
+
+        # 允许按 retry_delay（短）睡眠，但不允许用 throttle_delay 长睡
+        joined = " ".join(sleep_args)
+        self.assertNotIn("throttle_delay", joined,
+                         "限流冷却不应在持锁状态下长睡，应交给延迟队列")
+
+    def test_preupload_406_goes_to_deferred_queue(self):
+        source = self._source()
+        # 406 分支必须写 retry_after 并置回 pending
+        self.assertIn("preupload 406 限流，已排队等待重试", source)
+        idx = source.index("preupload 406 限流，已排队等待重试")
+        window = source[max(0, idx - 500):idx + 500]
+        self.assertIn("retry_after", window)
+        self.assertIn("PENDING", window)

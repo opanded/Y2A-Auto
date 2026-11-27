@@ -824,6 +824,30 @@ def _compute_retry_after(minutes: int) -> str:
     return (datetime.now() + timedelta(minutes=max(1, int(minutes)))).strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _is_daily_quota_exhausted(result) -> bool:
+    """判断是否为「当日投稿配额耗尽」（而非分钟级频率限流）。
+
+    B站 137022「投稿过于频繁」在配额用尽时才出现，分钟内重试必然继续失败；
+    分钟级频率限制通常是 preupload 406 或其它提示。两者的退避窗口差一个数量级：
+    前者要等自然日重置，后者等几十分钟即可。
+    """
+    text = str(result or '')
+    if not text:
+        return False
+    return ('137022' in text) or ('投稿过于频繁' in text)
+
+
+def _compute_next_daily_reset(hour: int = 0, minute: int = 30) -> str:
+    """返回下一个每日重置时点（默认次日 00:30），用于日配额耗尽后的顺延。"""
+    now = datetime.now()
+    hour = min(23, max(0, int(hour)))
+    minute = min(59, max(0, int(minute)))
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target.strftime('%Y-%m-%d %H:%M:%S')
+
+
 def _is_retry_after_reached(retry_after) -> bool:
     """判断 retry_after 是否已到期。空值视为「无延迟」，立即可跑。"""
     raw = str(retry_after or '').strip()
@@ -858,6 +882,31 @@ def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None):
                     "平台限流重试已达上限 %d 次，保留失败状态交由人工处理", max_retries
                 )
             return False
+
+    # 日配额耗尽与分钟级限流的退避窗口差一个数量级：
+    # 前者在自然日重置前重试必然继续失败，每 2 小时撞一次只是白耗请求，
+    # 因此直接顺延到次日重置时点（默认 00:30）。可用
+    # UPLOAD_DAILY_QUOTA_DEFER_ENABLED=False 退回固定分钟退避。
+    if _is_daily_quota_exhausted(result) and _as_bool(
+        cfg.get('UPLOAD_DAILY_QUOTA_DEFER_ENABLED', True)
+    ):
+        hour = _as_int(cfg.get('DAILY_UPLOAD_RETRY_HOUR', 0), 0, minimum=0)
+        minute = _as_int(cfg.get('DAILY_UPLOAD_RETRY_MINUTE', 30), 30, minimum=0)
+        retry_after = _compute_next_daily_reset(hour, minute)
+        _bump_rate_limit_retry_count(task_id)
+        update_task(
+            task_id,
+            status=TASK_STATES['PENDING'],
+            error_message=f"日投稿配额已用尽，已顺延至 {retry_after} 继续",
+            retry_after=retry_after,
+            upload_progress=None,
+            silent=True,
+        )
+        if logger_obj:
+            logger_obj.warning(
+                "日投稿配额已用尽（137022）：任务顺延到 %s，避免整夜空转", retry_after
+            )
+        return True
 
     retry_after = _compute_retry_after(minutes)
     _bump_rate_limit_retry_count(task_id)
@@ -10325,13 +10374,16 @@ class TaskProcessor:
         """调用 bilibili 上传，并对可恢复的失败自动重试。
 
         - 网络抖动（curl 28 超时、连接重置）→ 快速重试。
-        - preupload 406（上传频率限流）→ 用更长的等待重试，避免继续撞墙。
+        - preupload 406（上传频率限流）→ 不在这里睡，直接返回失败，
+          交给上层的延迟队列在后台等待。这条路径在持有上传锁的状态下运行，
+          睡 600 秒会让后面所有任务全卡在「等待获取上传锁」。
         - 账号级风控（-352 / 603 / cookie 失效）→ 不重试。
         """
         from modules.bilibili_uploader import _compact_exception_text
 
         max_attempts = max(1, _as_int(self.config.get('UPLOAD_NETWORK_MAX_ATTEMPTS', 3), 3, minimum=1))
         retry_delay = max(0, _as_int(self.config.get('UPLOAD_NETWORK_RETRY_DELAY', 15), 15, minimum=0))
+        # 仅用于日志/上层排程提示，本地不做长睡
         throttle_delay = max(
             0, _as_int(self.config.get('UPLOAD_THROTTLE_RETRY_DELAY', 180), 180, minimum=0)
         )
@@ -10359,18 +10411,25 @@ class TaskProcessor:
             if attempt >= max_attempts or not _is_retryable_upload_error(result):
                 return success, result
 
-            # 限流场景需要更长冷却，否则重试仍会被 406 挡回
+            # 限流（preupload 406）需要分钟级冷却：交给上层延迟队列，
+            # 不在此处持锁 sleep，否则同批任务会全部饿死在锁上。
             text = str(result).lower()
             is_throttle = 'preupload' in text and '406' in text
-            wait_s = throttle_delay if is_throttle else retry_delay
+            if is_throttle:
+                task_logger.warning(
+                    "bilibili上传被限流（第 %d/%d 次）：%s；转交延迟队列约 %d 秒后重试",
+                    attempt, max_attempts,
+                    _compact_exception_text(str(result)), throttle_delay,
+                )
+                return False, result
+
             task_logger.warning(
-                "bilibili上传失败（第 %d/%d 次，%s）：%s；%d 秒后重试",
+                "bilibili上传失败（第 %d/%d 次，网络重试）：%s；%d 秒后重试",
                 attempt, max_attempts,
-                '限流冷却' if is_throttle else '网络重试',
-                _compact_exception_text(str(result)), wait_s,
+                _compact_exception_text(str(result)), retry_delay,
             )
-            if wait_s:
-                time.sleep(wait_s)
+            if retry_delay:
+                time.sleep(retry_delay)
 
         return False, last_result
 
@@ -10671,9 +10730,32 @@ class TaskProcessor:
                 # 平台级限流（137022 投稿过于频繁）无法靠秒级重试恢复：
                 # 排入延迟队列，到点后由 pending 扫描器自动重新上传。
                 # 同时通知节流器降速，避免后续任务继续撞墙。
-                if _is_platform_rate_limit_error(result):
+                text_result = str(result or '').lower()
+                is_preupload_throttle = 'preupload' in text_result and '406' in text_result
+                if _is_platform_rate_limit_error(result) or is_preupload_throttle:
                     note_upload_rate_limited(self.config)
                 if _schedule_rate_limit_retry(task_id, task_logger, result, self.config):
+                    return
+                if is_preupload_throttle:
+                    # preupload 406 是频率限流，不是永久失败：交给延迟队列，
+                    # 否则任务会停在 uploading 且占着上传锁，后续任务全部饿死。
+                    minutes = max(
+                        1,
+                        _as_int(self.config.get('UPLOAD_THROTTLE_RETRY_DELAY', 180), 180,
+                                minimum=60) // 60,
+                    )
+                    retry_after = _compute_retry_after(minutes)
+                    update_task(
+                        task_id,
+                        status=TASK_STATES['PENDING'],
+                        error_message=f"preupload 406 限流，已排队等待重试（{minutes} 分钟后）",
+                        retry_after=retry_after,
+                        upload_progress=None,
+                        silent=True,
+                    )
+                    task_logger.warning(
+                        "preupload 406：任务已排入延迟队列，将在 %s 自动重试", retry_after
+                    )
                     return
                 update_task(
                     task_id,
