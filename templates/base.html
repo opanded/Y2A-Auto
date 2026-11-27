@@ -12,6 +12,10 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <!-- 深色主题（Bootstrap 5.1 无原生深色模式，用覆盖 CSS 变量实现） -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/theme-dark.css') }}">
+    <!-- 质感层：纸面颗粒、渐变描边、多层阴影。
+         必须排在主题之后——主题用 `background:` 简写设底色，
+         简写会重置 background-image，只有后加载才能补回纹理。 -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/art.css') }}">
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='img/favicon.png') }}">
     <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
     <script>
@@ -38,6 +42,8 @@
         <nav class="navbar navbar-expand-lg navbar-dark">
             <div class="container navbar-shell">
                 <a class="navbar-brand d-flex align-items-center" href="{{ url_for('index') }}">
+                    <img class="brand-mark" src="{{ url_for('static', filename='img/brand-mark.svg') }}"
+                         alt="" aria-hidden="true" width="26" height="26">
                     <span>Y2A-Auto</span>
                 </a>
                 <div class="navbar-utility ms-auto d-flex align-items-center gap-2">

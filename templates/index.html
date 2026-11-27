@@ -154,7 +154,7 @@
                         role="link" tabindex="0">
                         <td class="text-monospace">{{ t.id[:6] }}…</td>
                         <td class="title-clamp title-clamp-2">{{ t.title }}</td>
-                        <td class="text-center"><span class="badge bg-{{ task_status_color(t.status) }}">{{ task_status_display(t.status) }}</span></td>
+                        <td class="text-center"><span class="badge task-status-badge bg-{{ task_status_color(t.status) }}">{{ task_status_display(t.status) }}</span></td>
                         <td class="text-center"><span class="task-datetime" data-datetime="{{ t.updated_at }}">{{ t.updated_at }}</span></td>
                         <td class="text-end">
                             {% if t.upload_id %}
@@ -175,7 +175,32 @@
             </table>
         </div>
         {% else %}
-            <div class="p-3 text-muted">暂无最近动态</div>
+            <div class="art-empty">
+                {# 内联而非 <img>：要继承 currentColor 才能跟随深浅主题 #}
+                <svg class="art-empty-mark" viewBox="0 0 96 96" fill="none" aria-hidden="true">
+                    <defs>
+                        <linearGradient id="emptyFlow" x1="10" y1="76" x2="86" y2="24" gradientUnits="userSpaceOnUse">
+                            <stop stop-color="currentColor" stop-opacity="0.15"/>
+                            <stop offset="0.55" stop-color="currentColor" stop-opacity="0.55"/>
+                            <stop offset="1" stop-color="currentColor" stop-opacity="0.2"/>
+                        </linearGradient>
+                    </defs>
+                    <circle cx="48" cy="48" r="30" stroke="currentColor" stroke-opacity="0.12"
+                            stroke-width="1.2" stroke-dasharray="3 6"/>
+                    <path d="M12 72C28 72 32 52 44 48" stroke="url(#emptyFlow)" stroke-width="1.6" stroke-linecap="round"/>
+                    <path d="M84 28C68 28 64 44 52 48" stroke="url(#emptyFlow)" stroke-width="1.6" stroke-linecap="round"/>
+                    <circle cx="48" cy="48" r="8" stroke="currentColor" stroke-opacity="0.28" stroke-width="1.3"/>
+                    <circle cx="48" cy="48" r="2.6" fill="currentColor" fill-opacity="0.4"/>
+                    <g fill="currentColor" fill-opacity="0.3">
+                        <circle cx="30" cy="36" r="1.4"/>
+                        <circle cx="66" cy="60" r="1.4"/>
+                        <circle cx="38" cy="62" r="1.2"/>
+                        <circle cx="58" cy="34" r="1.2"/>
+                    </g>
+                </svg>
+                <div class="small">暂无最近动态</div>
+                <div class="small opacity-75">监控抓到新视频后会自动出现在这里</div>
+            </div>
         {% endif %}
     </div>
     <div class="card-footer text-muted small">

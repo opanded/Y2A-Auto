@@ -848,6 +848,36 @@ def _compute_next_daily_reset(hour: int = 0, minute: int = 30) -> str:
     return target.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _daily_quota_retry_after(attempts: int, config=None) -> tuple:
+    """日配额耗尽后该排到什么时候：返回 (retry_after, 说明文案, 等待秒数)。
+
+    默认假设配额按自然日 00:30 重置，先排到那个点。但实测 2026-11-28 00:30
+    仍然返回 137022——说明重置不在 00:00，或者账号走的是滚动窗口。
+    若此刻距下一个重置点超过 20 小时，等于刚刚就在重置点上失败，
+    再顺延过去会让任务整日空转（实测被推到 11-29）。此时改用递增探测：
+    4h → 8h → 16h，让任务当天仍有机会投出去。
+    """
+    cfg = config or {}
+    hour = _as_int(cfg.get('DAILY_UPLOAD_RETRY_HOUR', 0), 0, minimum=0)
+    minute = _as_int(cfg.get('DAILY_UPLOAD_RETRY_MINUTE', 30), 30, minimum=0)
+    next_reset = _compute_next_daily_reset(hour, minute)
+
+    now = datetime.now()
+    hours_to_reset = (
+        datetime.strptime(next_reset, '%Y-%m-%d %H:%M:%S') - now
+    ).total_seconds() / 3600
+
+    if hours_to_reset > 20:
+        probe_hours = min(16, 4 * (2 ** min(2, max(0, attempts))))
+        return (
+            _compute_retry_after(probe_hours * 60),
+            f"日投稿配额耗尽（重置点仍被拒），{probe_hours} 小时后探测",
+            probe_hours * 3600,
+        )
+    wait_seconds = int((datetime.strptime(next_reset, '%Y-%m-%d %H:%M:%S') - now).total_seconds())
+    return next_reset, "日投稿配额已用尽，已顺延至重置点继续", wait_seconds
+
+
 def _is_retry_after_reached(retry_after) -> bool:
     """判断 retry_after 是否已到期。空值视为「无延迟」，立即可跑。"""
     raw = str(retry_after or '').strip()
@@ -884,28 +914,23 @@ def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None):
             return False
 
     # 日配额耗尽与分钟级限流的退避窗口差一个数量级：
-    # 前者在自然日重置前重试必然继续失败，每 2 小时撞一次只是白耗请求，
-    # 因此直接顺延到次日重置时点（默认 00:30）。可用
-    # UPLOAD_DAILY_QUOTA_DEFER_ENABLED=False 退回固定分钟退避。
+    # 前者在配额恢复前重试必然继续失败，每 2 小时撞一次只是白耗请求。
     if _is_daily_quota_exhausted(result) and _as_bool(
         cfg.get('UPLOAD_DAILY_QUOTA_DEFER_ENABLED', True)
     ):
-        hour = _as_int(cfg.get('DAILY_UPLOAD_RETRY_HOUR', 0), 0, minimum=0)
-        minute = _as_int(cfg.get('DAILY_UPLOAD_RETRY_MINUTE', 30), 30, minimum=0)
-        retry_after = _compute_next_daily_reset(hour, minute)
+        attempts = _get_rate_limit_retry_count(task_id)
+        retry_after, note, _wait = _daily_quota_retry_after(attempts, cfg)
         _bump_rate_limit_retry_count(task_id)
         update_task(
             task_id,
             status=TASK_STATES['PENDING'],
-            error_message=f"日投稿配额已用尽，已顺延至 {retry_after} 继续",
+            error_message=note,
             retry_after=retry_after,
             upload_progress=None,
             silent=True,
         )
         if logger_obj:
-            logger_obj.warning(
-                "日投稿配额已用尽（137022）：任务顺延到 %s，避免整夜空转", retry_after
-            )
+            logger_obj.warning("%s（137022）：任务排到 %s", note, retry_after)
         return True
 
     retry_after = _compute_retry_after(minutes)
@@ -2917,12 +2942,24 @@ def note_upload_success():
         _upload_penalty_factor = 1
 
 
-def note_upload_rate_limited(config=None):
-    """上传撞上平台限流：记录惩罚窗口，并让后续等待时间继续加倍。"""
+def note_upload_rate_limited(config=None, *, daily_quota=False, defer_seconds=None):
+    """上传撞上平台限流：记录惩罚窗口，并让后续等待时间继续加倍。
+
+    daily_quota=True 表示 137022（当日投稿配额已用尽）。这种情况不是「发太快」，
+    加倍惩罚毫无意义——配额恢复前发多少都会被拒。但也不能完全不管：
+    若不加窗口，队列里其余任务会一条接一条地去撞同一堵墙（实测 22 条
+    在零点点后挨个失败）。所以这里只压静默窗口、不放大倍数，
+    让整条队列一起等到下次探测时间点。
+    """
     global _upload_penalty_until, _upload_penalty_factor
     cfg = config or {}
-    cooldown_min = _as_int(cfg.get('UPLOAD_RATE_LIMIT_RETRY_MINUTES', 120), 120, minimum=1)
     with _upload_pace_lock:
+        if daily_quota:
+            # 只设静默窗口：期间所有任务由节流器统一延后，不再逐条试错。
+            window = defer_seconds if defer_seconds and defer_seconds > 0 else 4 * 3600
+            _upload_penalty_until = max(_upload_penalty_until, time.time() + window)
+            return
+        cooldown_min = _as_int(cfg.get('UPLOAD_RATE_LIMIT_RETRY_MINUTES', 120), 120, minimum=1)
         _upload_penalty_factor = min(8, max(1, _upload_penalty_factor) * 2)
         # 与延迟重试保持一致：限流后一段时间内不再发起任何上传
         _upload_penalty_until = max(
@@ -10729,11 +10766,19 @@ class TaskProcessor:
                 task_logger.error(f"bilibili上传失败: {result}")
                 # 平台级限流（137022 投稿过于频繁）无法靠秒级重试恢复：
                 # 排入延迟队列，到点后由 pending 扫描器自动重新上传。
-                # 同时通知节流器降速，避免后续任务继续撞墙。
+                # preupload 406 才是「发太快」，需要通知节流器降速；
+                # 137022 是当日配额用尽，加倍惩罚只会拖累次日的重置窗口。
                 text_result = str(result or '').lower()
                 is_preupload_throttle = 'preupload' in text_result and '406' in text_result
-                if _is_platform_rate_limit_error(result) or is_preupload_throttle:
+                if is_preupload_throttle:
                     note_upload_rate_limited(self.config)
+                elif _is_platform_rate_limit_error(result):
+                    # 交给节流器压住整条队列：静默窗口与本次探测间隔对齐，
+                    # 避免 22 条任务在探测点前挨个去撞同一堵墙。
+                    _, _, _wait = _daily_quota_retry_after(
+                        _get_rate_limit_retry_count(task_id), self.config)
+                    note_upload_rate_limited(
+                        self.config, daily_quota=True, defer_seconds=_wait)
                 if _schedule_rate_limit_retry(task_id, task_logger, result, self.config):
                     return
                 if is_preupload_throttle:

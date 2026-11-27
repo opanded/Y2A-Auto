@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+  <!--
+    品牌徽标：Y 形的两条斜臂在中央汇合，再落成一根短竖。
+    通过 <img> 引入时 currentColor 会退化成黑色，所以写死白色——
+    徽标只用在深蓝导航栏上。
+  -->
+  <defs>
+    <linearGradient id="brandFill" x1="6" y1="6" x2="26" y2="26" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8ec3ff"/>
+      <stop offset="1" stop-color="#b7a6ff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 左臂、右臂 -->
+  <path d="M7 7.5 15.4 17" stroke="#ffffff" stroke-width="2.7" stroke-linecap="round" stroke-opacity="0.94"/>
+  <path d="M25 7.5 16.6 17" stroke="#ffffff" stroke-width="2.7" stroke-linecap="round" stroke-opacity="0.94"/>
+  <!-- 竖干 -->
+  <path d="M16 17v7.5" stroke="#ffffff" stroke-width="2.7" stroke-linecap="round" stroke-opacity="0.72"/>
+  <!-- 汇合点 -->
+  <circle cx="16" cy="17" r="3" fill="url(#brandFill)"/>
+</svg>
