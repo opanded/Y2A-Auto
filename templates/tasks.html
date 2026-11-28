@@ -104,8 +104,13 @@
         </div>
     </div>
 
-    <form method="post" action="{{ url_for('tasks_bulk_action') }}" id="bulkActionForm">
+    {# 批量操作表单只包住操作栏本身。
+       任务行里的按钮各自是 <form>，HTML 不允许表单嵌套——
+       把整个列表包进来会让浏览器丢掉内层 form，点行内按钮就提交了批量表单，
+       弹出「请先勾选要操作的任务」（实测就是这个现象）。
+       行内复选框通过 form="bulkActionForm" 属性关联到这个表单。 #}
     <div class="bulk-action-bar" id="bulkActionBar" hidden>
+        <form method="post" action="{{ url_for('tasks_bulk_action') }}" id="bulkActionForm">
         <input type="hidden" name="back" value="{{ request.full_path }}">
         <div class="d-flex align-items-center gap-2 flex-wrap">
             <span class="text-muted small">已选 <strong id="bulkCount">0</strong> 项</span>
@@ -121,7 +126,13 @@
             </button>
             <button type="button" class="btn btn-sm btn-outline-secondary" id="bulkClearBtn">取消选择</button>
         </div>
+        </form>
     </div>
+
+    {# 批量操作表单只包住操作栏本身（见上方注释）。
+       行内复选框通过 form="bulkActionForm" 关联过来——
+       form 属性关联与元素是否可见无关，所以操作栏 hidden 时依然成立。 #}
+
     <div class="modern-list">
         <!-- 桌面端表格（md及以上显示） -->
         <div class="table-responsive modern-table d-none d-md-block">
@@ -162,7 +173,6 @@
                     </tbody>
                 </table>
         </div>
-    </form>
 
         <!-- 移动端卡片（md以下显示） -->
         <div class="d-block d-md-none">

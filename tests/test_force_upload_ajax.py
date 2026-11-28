@@ -205,3 +205,82 @@ class UploadProgressDomTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FormNestingTests(unittest.TestCase):
+    """任务列表不能出现嵌套 <form>。
+
+    原先把整张表格包在 bulkActionForm 里，而行内操作按钮各自也是 <form>。
+    HTML 不允许表单嵌套——浏览器会丢掉内层 form，于是点行内「重试」实际
+    提交了外层批量表单，flash「请先勾选要操作的任务」。
+    实测 DOM：bulkActionForm 内曾嵌着 38 个 form。
+    """
+
+    def _read(self, rel):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        return (root / 'templates' / rel).read_text(encoding='utf-8')
+
+    def test_row_checkbox_uses_form_attribute(self):
+        src = self._read('partials/task_row.html')
+        idx = src.index('task-select-checkbox')
+        window = src[max(0, idx - 400):idx + 300]
+        self.assertIn('form="bulkActionForm"', window,
+                      '行内复选框必须用 form 属性关联批量表单，而不是被它包裹')
+
+    def test_bulk_form_does_not_wrap_task_list(self):
+        src = self._read('tasks.html')
+        idx = src.index('id="bulkActionForm"')
+        # 从开标签往后找，列表容器必须出现在 </form> 之后
+        rest = src[idx:]
+        form_close = rest.index('</form>')
+        list_start = rest.index('class="modern-list"')
+        self.assertLess(form_close, list_start,
+                        'bulkActionForm 必须在任务列表开始前闭合，否则产生嵌套表单')
+
+    def test_form_tags_balanced(self):
+        src = self._read('tasks.html')
+        # 注释里提到 <form> 字样，先剥离 Jinja 注释
+        import re
+        body = re.sub(r'\{#.*?#\}', '', src, flags=re.S)
+        opens = body.count('<form')
+        closes = body.count('</form>')
+        self.assertEqual(opens, closes, f'form 标签不配对：{opens} 开 / {closes} 闭')
+
+
+class DailyQuotaNotCappedByMaxRetriesTests(unittest.TestCase):
+    """日配额耗尽不受 UPLOAD_RATE_LIMIT_MAX_RETRIES 限制。
+
+    实测：11-27 撞 137022 后，第 5 次探测把任务打成 failed，
+    但配额只是「暂时没额度」，第二天会自己回来。
+    判成永久失败只会让任务堆在失败列表里等人手点。
+    """
+
+    def setUp(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        self.src = (root / 'modules' / 'task_manager.py').read_text(encoding='utf-8')
+
+    def test_max_retries_excludes_daily_quota(self):
+        idx = self.src.index('def _schedule_rate_limit_retry')
+        body = self.src[idx:idx + 1600]
+        self.assertIn('is_daily_quota', body)
+        # 上限判断必须排除日配额：条件里出现 not is_daily_quota
+        cap_idx = body.index('if max_retries')
+        window = body[cap_idx:cap_idx + 200]
+        self.assertIn('not is_daily_quota', window,
+                      '日配额耗尽不能吃掉 max_retries 上限')
+
+    def test_manual_attempts_skip_retry_cap(self):
+        idx = self.src.index('def _schedule_rate_limit_retry')
+        body = self.src[idx:idx + 1600]
+        cap_idx = body.index('if max_retries')
+        window = body[cap_idx:cap_idx + 200]
+        self.assertIn('not manual', window,
+                      '手动上传不消耗自动重试预算')
+
+    def test_manual_does_not_bump_counter(self):
+        idx = self.src.index('def _schedule_rate_limit_retry')
+        body = self.src[idx:idx + 2400]
+        self.assertIn('if not manual:\n            _bump_rate_limit_retry_count', body,
+                      '手动尝试不应累加自动退避计数')

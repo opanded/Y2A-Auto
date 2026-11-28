@@ -881,11 +881,14 @@ def _is_retry_after_reached(retry_after) -> bool:
     return datetime.now() >= due
 
 
-def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None):
+def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None, manual=False):
     """把因平台限流失败的任务排入延迟重试队列。
 
     返回 True 表示已排入（任务保持 PENDING 并写入 retry_after），
     返回 False 表示不启用延迟重试，调用方应维持原有失败处理。
+
+    manual=True 表示这次是用户手动点上传触发的：
+    手动尝试不消耗自动重试预算，也不该把它推到失败。
     """
     cfg = config or {}
     if not _as_bool(cfg.get('UPLOAD_RATE_LIMIT_RETRY_ENABLED', True)):
@@ -895,7 +898,13 @@ def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None):
 
     minutes = _as_int(cfg.get('UPLOAD_RATE_LIMIT_RETRY_MINUTES', 120), 120, minimum=1)
     max_retries = _as_int(cfg.get('UPLOAD_RATE_LIMIT_MAX_RETRIES', 5), 5, minimum=0)
-    if max_retries:
+    is_daily_quota = _is_daily_quota_exhausted(result)
+
+    # 日配额耗尽不吃 max_retries 上限：它只是「暂时没额度」，
+    # 配额必然恢复，判成永久失败只会让任务停在失败列表里等人来点。
+    # 实测 11-27 撞 137022 后 5 次探测就把任务打成 failed，
+    # 而实际上第二天额度会自己回来。
+    if max_retries and not is_daily_quota and not manual:
         attempts = _get_rate_limit_retry_count(task_id)
         if attempts >= max_retries:
             if logger_obj:
@@ -906,12 +915,13 @@ def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None):
 
     # 日配额耗尽与分钟级限流的退避窗口差一个数量级：
     # 前者在配额恢复前重试必然继续失败，每 2 小时撞一次只是白耗请求。
-    if _is_daily_quota_exhausted(result) and _as_bool(
+    if is_daily_quota and _as_bool(
         cfg.get('UPLOAD_DAILY_QUOTA_DEFER_ENABLED', True)
     ):
         attempts = _get_rate_limit_retry_count(task_id)
         retry_after, note, _wait = _daily_quota_retry_after(attempts, cfg)
-        _bump_rate_limit_retry_count(task_id)
+        if not manual:
+            _bump_rate_limit_retry_count(task_id)
         update_task(
             task_id,
             status=TASK_STATES['PENDING'],
@@ -10113,7 +10123,7 @@ class TaskProcessor:
                         else:
                             task_logger.info("上传节流检查被取消，放弃本次上传")
                         return
-                self._do_upload_to_bilibili(task_id, task_logger, subtitle_prepared=subtitle_prepared)
+                self._do_upload_to_bilibili(task_id, task_logger, subtitle_prepared=subtitle_prepared, manual=manual)
                 task_logger.info("释放上传锁")
         except Exception as e:
             task_logger.error(f"获取或使用上传锁时出错: {e}")
@@ -10503,7 +10513,7 @@ class TaskProcessor:
             "上传节流：任务已放回队列，将于 %s 自动重试（不占用线程）", retry_after
         )
 
-    def _do_upload_to_bilibili(self, task_id, task_logger, subtitle_prepared=False):
+    def _do_upload_to_bilibili(self, task_id, task_logger, subtitle_prepared=False, manual=False):
         """实际执行上传到 Bilibili 的逻辑"""
         from modules.bilibili_uploader import BilibiliUploader
 
@@ -10794,7 +10804,7 @@ class TaskProcessor:
                         _get_rate_limit_retry_count(task_id), self.config)
                     note_upload_rate_limited(
                         self.config, daily_quota=True, defer_seconds=_wait)
-                if _schedule_rate_limit_retry(task_id, task_logger, result, self.config):
+                if _schedule_rate_limit_retry(task_id, task_logger, result, self.config, manual=manual):
                     return
                 if is_preupload_throttle:
                     # preupload 406 是频率限流，不是永久失败：交给延迟队列，

@@ -8,7 +8,12 @@
 {% set show_progress = (task.status in ['uploading', 'downloading', 'translating_subtitle', 'encoding_video', 'asr_transcribing']) and task.upload_progress %}
 <tr data-task-id="{{ task.id }}" data-task-status="{{ task.status }}" class="status-{{ task.status }}">
     <td>
+        {# 用 form 属性关联外层批量表单，而不是把它包在外面：
+           行内操作按钮各自是 <form>，HTML 不允许表单嵌套——浏览器会
+           丢掉内层 form，导致点行内「重试」实际提交了外层批量表单，
+           弹出「请先勾选要操作的任务」。 #}
         <input type="checkbox" class="form-check-input task-select-checkbox"
+               form="bulkActionForm"
                name="task_ids" value="{{ task.id }}" aria-label="选择任务 {{ task.id[:8] }}">
     </td>
     <td>
@@ -40,24 +45,16 @@
                 </span>
             {% endif %}
             <small class="text-muted mt-1{% if not show_progress %} d-none{% endif %}" data-task-progress>{{ task.upload_progress or '' }}</small>
+            {# 手动上传时就地展开的进度条，由 JS 填充；SSE 推 task_progress 时同步更新 #}
+            <div class="task-upload-progress d-none mt-1" data-task-upload-progress>
+                <div class="progress" style="height:6px; width:100px;">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated bg-success"
+                         role="progressbar" style="width:0%" aria-valuemin="0" aria-valuemax="100"
+                         data-task-upload-bar></div>
+                </div>
+                <small class="text-muted" data-task-upload-label></small>
+            </div>
             {{ subtitle_warning_badges(tv._subtitle_warnings, 'row') }}
-            {% if task.subtitle_warning_message %}
-                {% set subtitle_w = task.subtitle_warning_message|trim %}
-                {% if subtitle_w == 'subtitle_embed_failed' %}
-                    {% set subtitle_w_tip = '字幕烧录失败，已保留字幕文件并继续上传原视频' %}
-                {% elif subtitle_w == 'asr_failed_block_embed' %}
-                    {% set subtitle_w_tip = 'ASR/VAD 质量结局为 failed（来源不可信），已拒绝烧录字幕并继续上传原视频' %}
-                {% elif subtitle_w == 'asr_degraded_block_embed' %}
-                    {% set subtitle_w_tip = 'ASR/VAD 质量结局为 degraded 且未通过严格质检，已拒绝烧录字幕' %}
-                {% elif subtitle_w == 'subtitle_qc_rejected' %}
-                    {% set subtitle_w_tip = '字幕质检未通过，已拒绝烧录并保留字幕文件供人工检查' %}
-                {% elif subtitle_w == 'qc_unavailable' %}
-                    {% set subtitle_w_tip = '字幕质检未执行（文件缺失或执行异常），已按拒绝处理，可关闭字幕质检开关放行' %}
-                {% else %}
-                    {% set subtitle_w_tip = '字幕处理警告: ' ~ subtitle_w %}
-                {% endif %}
-                <span class="badge bg-warning text-dark mt-1" title="{{ subtitle_w_tip }}" data-bs-toggle="tooltip" data-bs-placement="top">字幕烧录异常</span>
-            {% endif %}
         </div>
     </td>
     <td>
