@@ -284,3 +284,44 @@ class DailyQuotaNotCappedByMaxRetriesTests(unittest.TestCase):
         body = self.src[idx:idx + 2400]
         self.assertIn('if not manual:\n            _bump_rate_limit_retry_count', body,
                       '手动尝试不应累加自动退避计数')
+
+
+class ManualUploadKeepsPlatformErrorTests(unittest.TestCase):
+    """手动上传失败时必须保留平台原始报错。
+
+    用户点「立即上传」，想看到的是 B站返回了什么（137022 投稿过于频繁），
+    而不是我们自己的「日投稿配额耗尽，N 小时后重试」。
+    后者是我们内部的排程说明，覆盖掉原始报错等于把平台的回答藏起来。
+    """
+
+    def setUp(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        self.src = (root / 'modules' / 'task_manager.py').read_text(encoding='utf-8')
+
+    def test_manual_branch_keeps_result_text(self):
+        idx = self.src.index('def _schedule_rate_limit_retry')
+        body = self.src[idx:idx + 2600]
+        self.assertIn('if manual:', body)
+        manual_idx = body.index('if manual:')
+        window = body[manual_idx:manual_idx + 900]
+        # 必须把原始 result 写进 error_message，而不是内部 note
+        self.assertIn('manual_note = f"{result}', window,
+                      '手动分支必须以平台原始报错为主体')
+        self.assertIn('error_message=manual_note', window)
+
+    def test_auto_branch_still_uses_friendly_note(self):
+        idx = self.src.index('def _schedule_rate_limit_retry')
+        body = self.src[idx:idx + 2600]
+        manual_idx = body.index('if manual:')
+        after = body[manual_idx:]
+        # 手动分支 return 之后，自动路径仍然写入 note
+        self.assertIn('error_message=note', after)
+
+    def test_manual_still_schedules_retry(self):
+        """保留原始报错不等于放弃排程，retry_after 必须照常写入。"""
+        idx = self.src.index('def _schedule_rate_limit_retry')
+        body = self.src[idx:idx + 2600]
+        manual_idx = body.index('if manual:')
+        window = body[manual_idx:manual_idx + 900]
+        self.assertIn('retry_after=retry_after', window)

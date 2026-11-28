@@ -121,11 +121,17 @@ class ManualUploadBypassesPaceTests(unittest.TestCase):
         )
 
     def test_manual_skips_pace_gate(self):
-        idx = self.source.index("if manual:")
-        window = self.source[idx:idx + 700]
+        # 在 _upload_to_bilibili 函数体内定位 manual 分支：
+        # 不能直接 index("if manual:")，别处（重试调度）也有同名分支。
+        fn_idx = self.source.index("def _upload_to_bilibili(self")
+        fn_body = self.source[fn_idx:fn_idx + 4000]
+        idx = fn_body.index("if manual:")
+        window = fn_body[idx:idx + 700]
         self.assertIn("跳过节流闸门", window)
         # manual 分支必须直接落到上传，不经过 wait_for_upload_slot
         self.assertIn("_do_upload_to_bilibili", window)
+        # 自动路径仍在 else 分支里检查节流
+        self.assertIn("wait_for_upload_slot", window)
 
     def test_force_upload_passes_manual(self):
         idx = self.source.index("def force_upload_task")

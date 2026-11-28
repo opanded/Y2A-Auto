@@ -922,6 +922,24 @@ def _schedule_rate_limit_retry(task_id, logger_obj, result, config=None, manual=
         retry_after, note, _wait = _daily_quota_retry_after(attempts, cfg)
         if not manual:
             _bump_rate_limit_retry_count(task_id)
+        if manual:
+            # 手动点「立即上传」时，用户要看到的是 B站的真实报错
+            # （这是我们自己的提醒不该覆盖它）。保留原始错误，只补一句下次重试时间。
+            manual_note = f"{result}（本次为手动上传；自动重试已排到 {retry_after}）"
+            update_task(
+                task_id,
+                status=TASK_STATES['PENDING'],
+                error_message=manual_note,
+                retry_after=retry_after,
+                upload_progress=None,
+                silent=True,
+            )
+            if logger_obj:
+                logger_obj.warning(
+                    "手动上传被平台拒绝（%s）：保留原始报错，自动重试排到 %s",
+                    result, retry_after,
+                )
+            return True
         update_task(
             task_id,
             status=TASK_STATES['PENDING'],
